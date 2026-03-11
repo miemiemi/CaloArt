@@ -1,0 +1,18 @@
+# @package _global_
+
+defaults:
+  - default
+  - _self_
+
+validate:
+    need_geo_condn: false
+    train_on: null
+    is_ccd: true
+    is_fpd: false
+    output_dir: ./generations/ccd2_flow
+    batch_size: 128
+    simulation_conditions:
+        - ['CCD2', -1, 0.0, 1.57, '/aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets/dataset_2_2.hdf5']
+sampling:
+    steps: 50
+    solver: euler

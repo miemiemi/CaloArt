@@ -1,0 +1,11 @@
+# CCD2 dataset paths
+train:
+    files:
+        - '/aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets/dataset_2_1.hdf5'
+    use_cond_info: true
+    is_ccd: true
+valid:
+    files:
+        - '/aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets/dataset_2_2.hdf5'
+    use_cond_info: true
+    is_ccd: true

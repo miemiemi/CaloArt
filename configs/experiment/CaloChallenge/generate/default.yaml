@@ -1,0 +1,21 @@
+# @package _global_
+
+defaults:
+  - /sampling: flow/euler_50
+  - _self_
+
+accelerator:
+    cpu: false
+    mixed_precision: "no"
+
+model:
+    model_path: null
+    architecture: null
+
+method: null
+
+generate:
+    output_dir: ./generations
+    num_samples: 10000
+    batch_size: 256
+    simulation_conditions: []

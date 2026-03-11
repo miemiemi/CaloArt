@@ -1,0 +1,34 @@
+.env
+.env.*
+!.env.example
+
+.project-root
+.vscode/
+
+__pycache__/
+*.py[cod]
+
+# Local run artifacts
+logs/
+outputs/
+experiments/
+generations/
+wandb/
+
+# Job and training logs
+*.log
+*.out
+*.err
+*slurm*.sh
+run_evaluation_ccd2_flow.sh
+
+# Common generated model/data artifacts
+*.h5
+*.pt
+*.pth
+*.ckpt
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

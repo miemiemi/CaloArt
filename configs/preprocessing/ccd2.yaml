@@ -1,0 +1,16 @@
+# CCD2 preprocessing pipeline
+steps:
+    - class_name: src.data.preprocessing.CutNoise
+      init_args:
+          noise_level: 0.5e-6
+          both_directions: false
+    - class_name: src.data.preprocessing.ScaleByFactor
+      init_args:
+          factor: 1
+    - class_name: src.data.preprocessing.LogTransform
+      init_args:
+          eps: 1.0e-08
+    - class_name: src.data.preprocessing.Standarize
+      init_args:
+          mean: -12.7870455
+          std: 3.118291

@@ -1,0 +1,672 @@
+import math
+from functools import partial
+from typing import *
+
+import numpy as np
+
+import torch
+import torch.nn as nn
+from einops import rearrange
+from torchinfo import summary
+
+from src.utils import str_to_dtype, convert_module_to, manual_cast
+from src.models.modules import MultiHeadAttention
+from src.models.rope import RotaryPositionEmbedder
+from src.models.layers_3drope import (LayerNorm32, FeedForwardNet)
+from src.models.layers import (
+    MLP,
+    Attention,
+    SinusoidalPositionEmbeddings,
+    AbsolutePositionEmbedder,
+    VolumeEmbedder,
+    VolumeUnembedder,
+    get_3d_sincos_pos_emb,
+    SwiGLU,
+    NALU
+)
+
+
+def modulate(x, scale, shift=None):
+    if shift is None:
+        shift = torch.zeros_like(scale)
+    return x * (1 + scale) + shift
+
+class TimestepEmbedder(nn.Module):
+    """
+    Embeds scalar timesteps into vector representations.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+
+        Args:
+            t: a 1-D Tensor of N indices, one per batch element.
+                These may be fractional.
+            dim: the dimension of the output.
+            max_period: controls the minimum frequency of the embeddings.
+
+        Returns:
+            an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(
+            -np.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
+
+class ConditionEmbedder(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class ModulatedTransformerBlock(nn.Module):
+    """
+    Transformer block (MSA + FFN) with adaptive layer norm conditioning.
+    """
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        attn_mode: Literal["full", "windowed"] = "full",
+        window_size: Optional[int] = None,
+        shift_window: Optional[Tuple[int, int, int]] = None,
+        use_checkpoint: bool = False,
+        use_rope: bool = False,
+        rope_freq: Tuple[int, int] = (1.0, 10000.0), 
+        qk_rms_norm: bool = False,
+        qkv_bias: bool = True,
+        share_mod: bool = False,
+    ):
+        super().__init__()
+        self.use_checkpoint = use_checkpoint
+        self.share_mod = share_mod
+        self.norm1 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
+        self.norm2 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
+        self.attn = MultiHeadAttention(
+            channels,
+            num_heads=num_heads,
+            attn_mode=attn_mode,
+            window_size=window_size,
+            shift_window=shift_window,
+            qkv_bias=qkv_bias,
+            use_rope=use_rope,
+            rope_freq=rope_freq,
+            qk_rms_norm=qk_rms_norm,
+        )
+        self.mlp = FeedForwardNet(
+            channels,
+            mlp_ratio=mlp_ratio,
+        )
+        if not share_mod:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(channels, 6 * channels, bias=True)
+            )
+        else:
+            self.modulation = nn.Parameter(torch.randn(6 * channels) / channels ** 0.5)
+
+    def _forward(self, x: torch.Tensor, mod: torch.Tensor, phases: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.share_mod:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.modulation + mod).type(mod.dtype).chunk(6, dim=1)
+        else:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(mod).chunk(6, dim=1)
+        h = self.norm1(x)
+        h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        h = self.attn(h, phases=phases)
+        h = h * gate_msa.unsqueeze(1)
+        x = x + h
+        h = self.norm2(x)
+        h = h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+        h = self.mlp(h)
+        h = h * gate_mlp.unsqueeze(1)
+        x = x + h
+        return x
+
+    def forward(self, x: torch.Tensor, mod: torch.Tensor, phases: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.use_checkpoint:
+            return torch.utils.checkpoint.checkpoint(self._forward, x, mod, phases, use_reentrant=False)
+        else:
+            return self._forward(x, mod, phases)
+
+class FinalLayerUsecheckpoint(nn.Module):
+    """
+    Condition injected final layer with adaptive layer norm conditioning.
+    """
+    def __init__(
+        self,
+        channels: int,
+        patch_size: Tuple[int, int, int], 
+        out_channels: int,
+        use_checkpoint: bool = False,
+    ):
+        super().__init__()
+        self.use_checkpoint = use_checkpoint
+        
+        try:
+            self.norm = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
+        except NameError:
+            self.norm = nn.LayerNorm(channels, elementwise_affine=False, eps=1e-6)
+            
+        if isinstance(patch_size, int):
+            patch_vol = patch_size
+        else:
+            patch_vol = math.prod(patch_size)
+
+        self.linear = nn.Linear(channels, patch_vol * out_channels, bias=True)
+
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(channels, 3 * channels, bias=True)
+        )
+
+    def _forward(self, x: torch.Tensor, mod: torch.Tensor) -> torch.Tensor:
+        # mod: (B, C)
+        # linear projection -> (B, 3C)
+        shift, scale, gate = self.adaLN_modulation(mod).chunk(3, dim=1)
+        
+        gate = torch.sigmoid(gate)
+        h = self.norm(x)
+        
+        # (B, 1, C)
+        h = h * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        
+        # Gating
+        x = (1 - gate.unsqueeze(1)) * x + gate.unsqueeze(1) * h
+        x = self.linear(x)
+        return x
+
+    def forward(self, x: torch.Tensor, mod: torch.Tensor) -> torch.Tensor:
+        if self.use_checkpoint:
+            return torch.utils.checkpoint.checkpoint(self._forward, x, mod, use_reentrant=False)
+        else:
+            return self._forward(x, mod)
+
+class CaloDiTBlock(nn.Module):
+    def __init__(self, hidden_size, num_heads, grid_size, mlp_ratio=4.0, **block_kwargs):
+        super().__init__()
+        self.seq_len = grid_size[0] * grid_size[1] * grid_size[2]
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.mlp = SwiGLU(in_features=hidden_size, hidden_features=mlp_hidden_dim, drop=0.0)
+        self.adaLN_modulation_pos = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+        self.adaLN_modulation_condn = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+
+    def forward(self, x, c, pos_emb):
+        c_ada = self.adaLN_modulation_condn(c).chunk(6, dim=-1)
+        pos_ada = self.adaLN_modulation_pos(pos_emb).chunk(6, dim=-1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+            list(map(lambda x, y: x.unsqueeze(1).expand(-1, self.seq_len, -1) + y.expand(c.shape[0], -1, -1), c_ada, pos_ada))
+        gate_msa, gate_mlp = torch.sigmoid(gate_msa), torch.sigmoid(gate_mlp)
+        x = (1 - gate_msa) * x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = (1 - gate_mlp) * x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+class FinalLayer(nn.Module):
+    def __init__(self, hidden_size, patch_size, out_channels, grid_size):
+        super().__init__()
+        self.seq_len = grid_size[0] * grid_size[1] * grid_size[2]
+        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, math.prod(patch_size) * out_channels, bias=True)
+        self.adaLN_modulation_condn = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+        )
+        self.adaLN_modulation_pos = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+        )
+
+    def forward(self, x, c, pos_emb):
+        c_ada = self.adaLN_modulation_condn(c).chunk(3, dim=-1)
+        pos_ada = self.adaLN_modulation_pos(pos_emb).chunk(3, dim=-1)
+        gate, shift, scale = \
+            list(map(lambda x, y: x.unsqueeze(1).expand(-1, self.seq_len, -1) + y.expand(c.shape[0], -1, -1), c_ada, pos_ada))
+        gate = torch.sigmoid(gate)
+        x = (1 - gate) * x + gate * modulate(self.norm(x), shift, scale)
+        x = self.linear(x)
+        return x
+
+class RopeCaloDiT(nn.Module):
+    """
+    CaloDiT with RoPE/APE and shared AdaLN modulation.
+    Input: (N, in_channels, R, PHI, Z)
+    input_size tuple and patch_size tuple is needed for rope and patchify 
+    rope and other position encoding computed with grid of size ((x / px) (y / py) (z / pz))
+    """
+    def __init__(
+        self,
+        input_size: Tuple[int, int, int], 
+        patch_size: Tuple[int, int, int], 
+        conditions_size: tuple,
+        in_channels: int,
+        model_channels: int,
+        out_channels: int,
+        num_blocks: int,
+        num_heads: Optional[int] = None,
+        num_head_channels: Optional[int] = 64,
+        mlp_ratio: float = 4.0,
+        pe_mode: Literal["ape", "rope"] = "ape",
+        rope_freq: Tuple[float, float] = (1.0, 10000.0),
+        dtype: str = 'float32',
+        use_checkpoint: bool = False,
+        share_mod: bool = False,
+        initialization: str = 'vanilla',
+        qk_rms_norm: bool = False,
+        use_conv: bool = False,
+        **kwargs
+    ):
+        super().__init__()
+        # 1. 基础参数保存
+        self.input_size = tuple(input_size)
+        self.patch_size = tuple(patch_size)
+        self.conditions_size = conditions_size
+        self.in_channels = in_channels
+        self.model_channels = model_channels
+        self.out_channels = out_channels
+        self.num_blocks = num_blocks
+        self.num_heads = num_heads or model_channels // num_head_channels
+        self.mlp_ratio = mlp_ratio
+        self.pe_mode = pe_mode
+        self.use_checkpoint = use_checkpoint
+        self.share_mod = share_mod
+        self.initialization = initialization
+        self.qk_rms_norm = qk_rms_norm
+        self.dtype = str_to_dtype(dtype) if isinstance(dtype, str) else dtype
+
+        # 2. 核心修改：先初始化 Patch Embedder
+        # 我们直接使用 VolumeEmbedder 来处理 grid_size 的计算逻辑
+        # 这样确保 RoPE 的网格和实际 Patch 的网格 100% 对齐
+        self.patch_embedder = VolumeEmbedder(
+            input_size=self.input_size,
+            patch_size=self.patch_size,
+            in_channels=self.in_channels,
+            out_channels=self.model_channels,
+            use_conv=use_conv
+        )
+        
+        # 3. 获取正确的 grid_size (D, H, W)
+        self.grid_size = self.patch_embedder.grid_size
+        self.num_patches = self.patch_embedder.num_patches
+
+        # ----------------------------------------------------------------
+        # 4. 位置编码逻辑 (Position Embedding)
+        # 注意：不要在 init 里用 .to(device)，使用 register_buffer
+        # ----------------------------------------------------------------
+        if pe_mode == "ape":
+            # Absolute Position Embedding
+            # 假设 AbsolutePositionEmbedder 接受 (dim, 3) 作为输入
+            pos_embedder = AbsolutePositionEmbedder(model_channels, 3)
+            
+            # 生成 3D 网格坐标
+            coords = torch.meshgrid(
+                *[torch.arange(s) for s in self.grid_size], 
+                indexing='ij'
+            )
+            # stack -> (D, H, W, 3) -> flatten -> (N_patches, 3)
+            coords = torch.stack(coords, dim=-1).reshape(-1, 3)
+            
+            # 计算 embedding
+            pos_emb = pos_embedder(coords) # (N_patches, model_channels)
+            
+            # 注册为 Buffer (不会被优化器更新，但会随模型保存和移动设备)
+            self.register_buffer("pos_emb", pos_emb.unsqueeze(0)) # (1, N, D)
+
+        elif pe_mode == "rope":
+            # Rotary Position Embedding
+            # RoPE 不需要可学习参数，它在 forward 中实时计算，这里预计算频率/相位
+            pos_embedder = RotaryPositionEmbedder(self.model_channels // self.num_heads, 3)
+            
+            coords = torch.meshgrid(
+                *[torch.arange(s) for s in self.grid_size], 
+                indexing='ij'
+            )
+            coords = torch.stack(coords, dim=-1).reshape(-1, 3)
+            
+            # 获取 RoPE 需要的预计算相位/频率表
+            rope_phases = pos_embedder(coords) 
+            self.register_buffer("rope_phases", rope_phases)
+        
+        if pe_mode != "rope":
+            self.rope_phases = None
+
+        # ----------------------------------------------------------------
+        # 5. 其他组件初始化
+        # ----------------------------------------------------------------
+        self.t_embedder = TimestepEmbedder(model_channels)
+        
+        # ConditionEmbedder dont support class-free guidance !!
+        self.c_embedders = nn.ModuleList([
+            ConditionEmbedder(c_size, model_channels) for c_size in self.conditions_size
+        ])
+
+        # 共享调制层 (如果启用)
+        if share_mod:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(model_channels, 6 * model_channels, bias=True)
+            )
+
+        # Transformer Blocks
+        self.blocks = nn.ModuleList([
+            ModulatedTransformerBlock(
+                model_channels,
+                num_heads=self.num_heads,
+                mlp_ratio=self.mlp_ratio,
+                attn_mode='full',
+                use_checkpoint=self.use_checkpoint,
+                use_rope=(pe_mode == "rope"),
+                rope_freq=rope_freq, # Block 内部通常不需要 freq，只需要 rope_phases，视具体实现而定
+                share_mod=share_mod,
+                qk_rms_norm=self.qk_rms_norm,
+            )
+            for _ in range(num_blocks)
+        ])
+
+        # 6. 输出层与 Unpatchify
+        # 修正：FinalLayer 的输出必须匹配 Unpatchify 的输入要求 (Patch体积 * C_out)
+        self.final_layer = FinalLayerUsecheckpoint(
+            channels=model_channels,
+            patch_size=self.patch_size,
+            out_channels=out_channels,
+            use_checkpoint=self.use_checkpoint
+        )
+        
+        self.unpatchify = VolumeUnembedder(
+            output_size=self.input_size, # 还原回原始尺寸
+            patch_size=self.patch_size,
+            out_channels=out_channels
+        )
+
+        self.initialize_weights()
+        self.convert_to(self.dtype)
+
+    @property
+    def device(self) -> torch.device:
+        """
+        Return the device of the model.
+        """
+        return next(self.parameters()).device
+    
+    def convert_to(self, dtype: torch.dtype) -> None:
+        """
+        Convert the torso of the model to the specified dtype.
+        """
+        self.dtype = dtype
+        self.blocks.apply(partial(convert_module_to, dtype=dtype))
+
+    def initialize_weights(self) -> None:
+        if self.initialization == 'vanilla':
+            # Initialize transformer layers:
+            def _basic_init(module):
+                if isinstance(module, (nn.Linear, nn.Conv3d)):
+                    torch.nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0)
+            self.apply(_basic_init)
+
+            # Initialize patch embedder like nn.Linear (instead of nn.Conv2d):
+            w = self.patch_embedder.proj.weight.data
+            nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+            nn.init.constant_(self.patch_embedder.proj.bias, 0)
+
+            # Initialize timestep embedding MLP:
+            nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+            nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+            # Initialize condition embedding MLPs:
+            for c_embedder in self.c_embedders:
+                for module in c_embedder.modules():
+                    if isinstance(module, nn.Linear):
+                        nn.init.normal_(module.weight, std=0.02)
+
+            # share_mod modulation initialize ? if grad boom maybe i should initialize them to 0
+
+            # Zero-out adaLN modulation layers in DiT blocks:
+            if self.share_mod:
+                nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+            else:
+                for block in self.blocks:
+                    nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                    nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+            # C. Final Layer (关键：Zero-Init)
+            # 1. Zero-out 线性投影层，使得初始输出为 0 (类似高斯噪声的均值)
+            nn.init.constant_(self.final_layer.linear.weight, 0)
+            nn.init.constant_(self.final_layer.linear.bias, 0)
+
+            if hasattr(self.final_layer, 'adaLN_modulation'):
+                nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+
+        elif self.initialization == 'scaled':
+            # Initialize transformer layers:
+            pass
+
+    def forward(self, x: torch.Tensor, c: Tuple[torch.Tensor, ...], t: torch.Tensor):
+            """
+            x: (N, in_channels, R, PHI, Z) tensor of showers
+            c: ((N, 1), (N, 2), (N, 1)) tuple of conditioning tensors
+            t: (N,) tensor of diffusion timesteps
+            """
+            # 1. 计算基础 Embeddings
+            t_emb = self.t_embedder(t) # Shape: (N, D)
+            
+            # 处理条件元组 c
+            c_embs = [c_embedder(c_i) for c_embedder, c_i in zip(self.c_embedders, c)]
+            
+            # 2. 生成全局原始条件向量 (Global Conditioning Vector)
+            # Shape: (N, D)，这是未经投影的原始特征空间
+            c_global = t_emb + sum(c_embs) 
+
+            # 3. 准备骨干网络专用条件 (Backbone Conditioning)
+            if self.share_mod:
+                # 如果启用共享调制，在此处统一投影到 6*D (或者 Block 需要的维度)
+                c_backbone = self.adaLN_modulation(c_global)
+            else:
+                # 如果独立调制，保持原始维度 D，交给 Block 内部的 MLP 处理
+                c_backbone = c_global
+
+            # 4. Patchify (Image -> Tokens)
+            x = self.patch_embedder(x)
+
+            # 5. 位置编码处理
+            # APE 模式：直接相加
+            if self.pe_mode == 'ape':
+                x = x + self.pos_emb
+            
+            # RoPE 模式：准备相位信息传给 Attention
+            rope = self.rope_phases if self.pe_mode == 'rope' else None
+
+            # 6. Transformer Blocks 循环
+            # 关键点：这里传入 c_backbone
+            for block in self.blocks:
+                x = block(x, c_backbone, phases=rope)
+
+            # 7. Final Layer
+            # 关键点：这里传入原始的 c_global (维度 D)
+            # 因为 FinalLayer 定义了自己的映射层 (adaLN_modulation_condn)，它期望输入维度为 model_channels
+            x = self.final_layer(x, c_global)    
+
+            # 8. Unpatchify (Tokens -> Image)
+            x = self.unpatchify(x)
+            
+            return x
+    
+    @property
+    def example_input(self):
+        x = torch.randn(1, self.in_channels, *self.input_size)
+        c = tuple(torch.randn(1, dim) for dim in self.conditions_size)
+        t = torch.randn(1)
+        return (x, c, t)
+    
+class CaloDiT(nn.Module):
+    """Following code from DiT: https://github.com/facebookresearch/DiT/blob/main/models.py"""
+
+    def __init__(
+        self,
+        input_size: tuple,
+        patch_size: tuple,
+        conditions_size: tuple,
+        in_channels=1,
+        out_channels=1,
+        emb_dim=384,
+        num_heads=6,
+        num_layers=6,
+        mlp_ratio=4,
+        pos_type='3DFixed',
+        use_conv=False
+    ):
+        super().__init__()
+        self.input_size = input_size
+        self.conditions_size = conditions_size
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.emb_dim = emb_dim
+        self.pos_type = pos_type
+        
+        self.patchify = VolumeEmbedder(input_size, patch_size, in_channels, emb_dim, use_conv=use_conv)
+        self.num_patches = self.patchify.num_patches
+        self.grid_size = self.patchify.grid_size
+
+        # positional embeddings
+        if self.pos_type=='3DFixed':
+            self.pos_emb = nn.Parameter(torch.zeros(1, self.num_patches, emb_dim), requires_grad=False)
+        elif self.pos_type=='Learned':
+            self.pos_emb = nn.Parameter(torch.zeros(1, self.num_patches, emb_dim), requires_grad=True)
+        else:
+            raise ValueError
+
+  
+        # conditions
+        self.t_embedder = TimestepEmbedder(emb_dim)
+        self.c_embedders = nn.ModuleList([
+            ConditionEmbedder(c_size, emb_dim) for c_size in conditions_size
+        ])
+
+        # layers
+        self.blocks = nn.ModuleList([
+            CaloDiTBlock(emb_dim, num_heads, self.grid_size, mlp_ratio=mlp_ratio) for _ in range(num_layers)
+        ])
+        self.final_layer = FinalLayer(emb_dim, patch_size, out_channels, self.grid_size)
+        
+        self.unpatchify = VolumeUnembedder(input_size, patch_size, out_channels)
+        
+        # Initialize weights
+        self.initialize_weights()
+    
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+
+        self.apply(_basic_init)
+
+        # Initialize (and freeze) pos_embed by sin-cos embedding:
+        if self.pos_type=='3DFixed':
+            self.pos_emb.data.copy_(
+                torch.from_numpy(get_3d_sincos_pos_emb(self.emb_dim, self.grid_size)).float().unsqueeze(0)
+            )
+        elif self.pos_type=='Learned':
+            nn.init.trunc_normal_(self.pos_emb, std=0.02)
+
+
+        # Initialize patch embedder like nn.Linear (instead of nn.Conv2d):
+        w = self.patchify.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.patchify.proj.bias, 0)
+
+        # Initialize timestep embedding MLP:
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        # Initialize condition embedding MLPs:
+        for c_embedder in self.c_embedders:
+            nn.init.normal_(c_embedder.mlp[0].weight, std=0.02)
+            nn.init.normal_(c_embedder.mlp[2].weight, std=0.02)
+            nn.init.normal_(c_embedder.mlp[4].weight, std=0.02)
+
+        # Zero-out adaLN modulation layers in DiT blocks:
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation_condn[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation_condn[-1].bias, 0)
+            nn.init.constant_(block.adaLN_modulation_pos[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation_pos[-1].bias, 0)
+
+
+        # Zero-out output layers:
+        nn.init.constant_(self.final_layer.adaLN_modulation_condn[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation_condn[-1].bias, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation_pos[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation_pos[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def forward(self, x: torch.Tensor, c: Tuple[torch.Tensor, ...], t: torch.Tensor):
+        """
+        x: (N, in_channels, R, PHI, Z) tensor of showers
+        c: ((N, 1), (N, 2), (N, 1)) tuple of conditioning tensors
+        t: (N,) tensor of diffusion timesteps
+        """
+        t = self.t_embedder(t) # t shape : torch.Size([256])
+        c = tuple(c_embedder(c_i) for c_embedder, c_i in zip(self.c_embedders, c)) # the tuple here has shape : (torch.Size([256, 144]), torch.Size([256, 144]), torch.Size([256, 144]))
+        # print(sum(c).shape)
+        c = t + sum(c) # shape :torch.Size([256, 144]) 
+
+        x = self.patchify(x) + self.pos_emb # self.pos_emb shape : torch.Size([1, 360, 144]) 
+        for block in self.blocks:
+            x = block(x, c, self.pos_emb)
+        x = self.final_layer(x, c, self.pos_emb)    # shape here : x :torch.Size([256, 360, 18]) 
+        x = self.unpatchify(x)
+        return x # torch.Size([256, 1, 9, 16, 45])
+
+    @property
+    def example_input(self):
+        x = torch.randn(1, self.in_channels, *self.input_size)
+        c = tuple(torch.randn(1, dim) for dim in self.conditions_size)
+        t = torch.randn(1)
+        return (x, c, t)
