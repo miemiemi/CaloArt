@@ -27,7 +27,7 @@ LOSS_TARGETS = ("v", "x1", "eps")
 
 
 class FlowMatching(MethodBase):
-    """Flow Matching wrapper for a backbone network (e.g. RopeCaloDiT).
+    """Flow Matching wrapper for a backbone network (e.g. CaloLightningDiT).
 
     Args:
         model:              backbone nn.Module with forward(x, conditions, t)

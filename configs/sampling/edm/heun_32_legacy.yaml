@@ -1,0 +1,7 @@
+steps: 32
+solver: heun
+solver_args:
+  s_churn: 0.0
+  s_tmin: 0.0
+  s_tmax: .inf
+  s_noise: 1.0

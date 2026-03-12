@@ -37,7 +37,7 @@ class AddNoise:
         return x + torch.rand_like(x) * self.noise_level
 
     def inverse_transform(self, x, _energy):
-        cut_below_noise_level(x, self.noise_level)
+        return cut_below_noise_level(x, self.noise_level)
 
 
 class LogitTransform:

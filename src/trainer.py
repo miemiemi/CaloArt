@@ -174,7 +174,7 @@ class DiffusionTrainer(object):
             self.max_steps = max_steps
         else:
             self.epochs = epochs
-            self.max_steps = epochs * self.batches_per_epoch - 1
+            self.max_steps = epochs * self.batches_per_epoch
 
         # model
         self.model = model

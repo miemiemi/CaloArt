@@ -9,7 +9,14 @@ __pycache__/
 *.py[cod]
 
 # Local run artifacts
-logs/
+logs/*
+!logs/.gitkeep
+!logs/slurm/
+!logs/archive/
+logs/slurm/*
+!logs/slurm/.gitkeep
+logs/archive/*
+!logs/archive/.gitkeep
 outputs/
 experiments/
 generations/
@@ -19,8 +26,10 @@ wandb/
 *.log
 *.out
 *.err
-*slurm*.sh
-run_evaluation_ccd2_flow.sh
+
+# Private one-off launchers can live here without polluting git status.
+scripts/slurm/local/*
+!scripts/slurm/local/.gitkeep
 
 # Common generated model/data artifacts
 *.h5
