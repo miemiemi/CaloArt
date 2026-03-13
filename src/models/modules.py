@@ -26,6 +26,8 @@ class MultiHeadAttention(nn.Module):
         window_size: Optional[int] = None,
         shift_window: Optional[Tuple[int, int, int]] = None,
         qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
         use_rope: bool = False,
         rope_freq: Tuple[float, float] = (1.0, 10000.0),
         qk_rms_norm: bool = False,
@@ -49,6 +51,8 @@ class MultiHeadAttention(nn.Module):
         self.shift_window = shift_window
         self.use_rope = use_rope
         self.qk_rms_norm = qk_rms_norm
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj_drop = nn.Dropout(proj_drop)
 
         if self._type == "self":
             self.to_qkv = nn.Linear(channels, channels * 3, bias=qkv_bias)
@@ -79,12 +83,16 @@ class MultiHeadAttention(nn.Module):
                         q = RotaryPositionEmbedder.apply_rotary_embedding(q, phases)
                         k = RotaryPositionEmbedder.apply_rotary_embedding(k, phases)
                     q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # [N,L,H,C] -> [N,H,L,C]
-                    h = F.scaled_dot_product_attention(q, k, v)
+                    h = F.scaled_dot_product_attention(
+                        q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0
+                    )
                     h = h.transpose(1, 2)  # [N,H,L,C] -> [N,L,H,C]
                 else:
                     q_tmp, k_tmp, v_tmp = qkv.unbind(dim=2)
                     q_tmp, k_tmp, v_tmp = q_tmp.transpose(1, 2), k_tmp.transpose(1, 2), v_tmp.transpose(1, 2)
-                    h = F.scaled_dot_product_attention(q_tmp, k_tmp, v_tmp)
+                    h = F.scaled_dot_product_attention(
+                        q_tmp, k_tmp, v_tmp, dropout_p=self.attn_drop.p if self.training else 0.0
+                    )
                     h = h.transpose(1, 2)
             elif self.attn_mode == "windowed":
                 raise NotImplementedError("Windowed attention is not yet implemented")
@@ -99,13 +107,18 @@ class MultiHeadAttention(nn.Module):
                 k, v = kv.unbind(dim=2)
                 k = self.k_rms_norm(k)
                 q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-                h = F.scaled_dot_product_attention(q, k, v)
+                h = F.scaled_dot_product_attention(
+                    q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0
+                )
                 h = h.transpose(1, 2)
             else:
                 k_tmp, v_tmp = kv.unbind(dim=2)
                 q, k_tmp, v_tmp = q.transpose(1, 2), k_tmp.transpose(1, 2), v_tmp.transpose(1, 2)
-                h = F.scaled_dot_product_attention(q, k_tmp, v_tmp)
+                h = F.scaled_dot_product_attention(
+                    q, k_tmp, v_tmp, dropout_p=self.attn_drop.p if self.training else 0.0
+                )
                 h = h.transpose(1, 2)
         h = h.reshape(B, L, -1)
         h = self.to_out(h)
+        h = self.proj_drop(h)
         return h

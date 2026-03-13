@@ -76,7 +76,7 @@ class CaloDiTBlock(nn.Module):
                 c_ada,
                 pos_ada,
             )
-        )
+        ) # (B, seq_len, hidden_size) diff with standard DiT (B, hidden_size)
         gate_msa, gate_mlp = torch.sigmoid(gate_msa), torch.sigmoid(gate_mlp)
         x = (1 - gate_msa) * x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x = (1 - gate_mlp) * x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))

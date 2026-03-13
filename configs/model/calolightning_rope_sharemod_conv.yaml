@@ -13,9 +13,6 @@ init_args:
   rope_freq: [1.0, 10000.0]
   share_mod: true
   qk_rms_norm: true
-  attn_drop: 0.0
-  proj_drop: 0.0
-  use_rmsnorm: false
   use_checkpoint: false
-  use_conv: false
+  use_conv: true
   initialization: vanilla

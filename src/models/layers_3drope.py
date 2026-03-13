@@ -19,6 +19,27 @@ class FeedForwardNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.mlp(x)
 
+
+class SwiGLUFFN(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        drop=0.0,
+        bias=True
+    ) -> None:
+        super().__init__()
+        hidden_dim = int(hidden_dim * 2 / 3)
+        self.w12 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
+        self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
+        self.ffn_dropout = nn.Dropout(drop)
+
+    def forward(self, x):
+        x12 = self.w12(x)
+        x1, x2 = x12.chunk(2, dim=-1)
+        hidden = F.silu(x1) * x2
+        return self.w3(self.ffn_dropout(hidden))
+    
 class VolumeEmbedder(nn.Module):
     def __init__(
         self,
@@ -165,3 +186,23 @@ class LayerNorm32(nn.LayerNorm):
         x = manual_cast(x, torch.float32)
         o = super().forward(x)
         return manual_cast(o, x_dtype)
+
+
+class RMSNorm32(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6, elementwise_affine: bool = True):
+        super().__init__()
+        self.variance_epsilon = eps
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+        else:
+            self.register_parameter("weight", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_dtype = x.dtype
+        x = manual_cast(x, torch.float32)
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        if self.weight is not None:
+            x = x * self.weight
+        return manual_cast(x, x_dtype)

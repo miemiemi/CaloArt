@@ -12,8 +12,9 @@ from src.models.modules import MultiHeadAttention
 from src.models.rope import RotaryPositionEmbedder
 from src.models.layers_3drope import (
     AbsolutePositionEmbedder,
-    FeedForwardNet,
     LayerNorm32,
+    RMSNorm32,
+    SwiGLUFFN,
     VolumeEmbedder,
     VolumeUnembedder,
 )
@@ -56,6 +57,7 @@ class TimestepEmbedder(nn.Module):
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
+    @torch.compile
     def forward(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
@@ -101,13 +103,21 @@ class CaloLightningDiTBlock(nn.Module):
         rope_freq: Tuple[int, int] = (1.0, 10000.0), 
         qk_rms_norm: bool = False,
         qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
         share_mod: bool = False,
+        use_rmsnorm: bool = False,
     ):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         self.share_mod = share_mod
-        self.norm1 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
-        self.norm2 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
+        self.use_rmsnorm = use_rmsnorm
+        if not use_rmsnorm:
+            self.norm1 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
+            self.norm2 = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
+        else:
+            self.norm1 = RMSNorm32(channels, eps=1e-6)
+            self.norm2 = RMSNorm32(channels, eps=1e-6)
         self.attn = MultiHeadAttention(
             channels,
             num_heads=num_heads,
@@ -115,25 +125,28 @@ class CaloLightningDiTBlock(nn.Module):
             window_size=window_size,
             shift_window=shift_window,
             qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
             use_rope=use_rope,
             rope_freq=rope_freq,
             qk_rms_norm=qk_rms_norm,
         )
-        self.mlp = FeedForwardNet(
-            channels,
-            mlp_ratio=mlp_ratio,
-        )
+        mlp_hidden_dim = int(channels * mlp_ratio)
+        self.mlp = SwiGLUFFN(channels, mlp_hidden_dim, drop=proj_drop)
         if not share_mod:
             self.adaLN_modulation = nn.Sequential(
                 nn.SiLU(),
                 nn.Linear(channels, 6 * channels, bias=True)
             )
         else:
-            self.modulation = nn.Parameter(torch.randn(6 * channels) / channels ** 0.5)
+            self.scale_shift_table = nn.Parameter(torch.randn(6, channels) / channels ** 0.5)
 
     def _forward(self, x: torch.Tensor, mod: torch.Tensor, phases: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.share_mod:
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.modulation + mod).type(mod.dtype).chunk(6, dim=1)
+            mod = mod.view(mod.shape[0], 6, -1)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                self.scale_shift_table[None] + mod
+            ).to(dtype=mod.dtype).unbind(dim=1)
         else:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(mod).chunk(6, dim=1)
         h = self.norm1(x)
@@ -148,13 +161,14 @@ class CaloLightningDiTBlock(nn.Module):
         x = x + h
         return x
 
+    @torch.compile
     def forward(self, x: torch.Tensor, mod: torch.Tensor, phases: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.use_checkpoint:
             return torch.utils.checkpoint.checkpoint(self._forward, x, mod, phases, use_reentrant=False)
         else:
             return self._forward(x, mod, phases)
 
-class FinalLayerUsecheckpoint(nn.Module):
+class FinalLayer(nn.Module):
     """
     Condition injected final layer with adaptive layer norm conditioning.
     """
@@ -164,14 +178,15 @@ class FinalLayerUsecheckpoint(nn.Module):
         patch_size: Tuple[int, int, int], 
         out_channels: int,
         use_checkpoint: bool = False,
+        use_rmsnorm: bool = False,
     ):
         super().__init__()
         self.use_checkpoint = use_checkpoint
-        
-        try:
-            self.norm = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
-        except NameError:
-            self.norm = nn.LayerNorm(channels, elementwise_affine=False, eps=1e-6)
+        self.use_rmsnorm = use_rmsnorm
+        if not use_rmsnorm:
+            self.norm_final = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
+        else:
+            self.norm_final = RMSNorm32(channels, eps=1e-6)
             
         if isinstance(patch_size, int):
             patch_vol = patch_size
@@ -191,7 +206,7 @@ class FinalLayerUsecheckpoint(nn.Module):
         shift, scale, gate = self.adaLN_modulation(mod).chunk(3, dim=1)
         
         gate = torch.sigmoid(gate)
-        h = self.norm(x)
+        h = self.norm_final(x)
         
         # (B, 1, C)
         h = h * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -201,11 +216,11 @@ class FinalLayerUsecheckpoint(nn.Module):
         x = self.linear(x)
         return x
 
+    @torch.compile
     def forward(self, x: torch.Tensor, mod: torch.Tensor) -> torch.Tensor:
         if self.use_checkpoint:
             return torch.utils.checkpoint.checkpoint(self._forward, x, mod, use_reentrant=False)
-        else:
-            return self._forward(x, mod)
+        return self._forward(x, mod)
 
 class CaloLightningDiT(nn.Module):
     """
@@ -245,6 +260,9 @@ class CaloLightningDiT(nn.Module):
         share_mod: bool = False,
         initialization: str = 'vanilla',
         qk_rms_norm: bool = False,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        use_rmsnorm: bool = False,
         use_conv: bool = False,
         **kwargs
     ):
@@ -264,6 +282,9 @@ class CaloLightningDiT(nn.Module):
         self.share_mod = share_mod
         self.initialization = initialization
         self.qk_rms_norm = qk_rms_norm
+        self.attn_drop = attn_drop
+        self.proj_drop = proj_drop
+        self.use_rmsnorm = use_rmsnorm
         self.dtype = str_to_dtype(dtype) if isinstance(dtype, str) else dtype
 
         # 2. 核心修改：先初始化 Patch Embedder
@@ -283,7 +304,6 @@ class CaloLightningDiT(nn.Module):
 
         # ----------------------------------------------------------------
         # 4. 位置编码逻辑 (Position Embedding)
-        # 注意：不要在 init 里用 .to(device)，使用 register_buffer
         # ----------------------------------------------------------------
         if pe_mode == "ape":
             # Absolute Position Embedding
@@ -351,17 +371,21 @@ class CaloLightningDiT(nn.Module):
                 rope_freq=rope_freq, # Block 内部通常不需要 freq，只需要 rope_phases，视具体实现而定
                 share_mod=share_mod,
                 qk_rms_norm=self.qk_rms_norm,
+                attn_drop=self.attn_drop,
+                proj_drop=self.proj_drop,
+                use_rmsnorm=self.use_rmsnorm,
             )
             for _ in range(num_blocks)
         ])
 
         # 6. 输出层与 Unpatchify
         # 修正：FinalLayer 的输出必须匹配 Unpatchify 的输入要求 (Patch体积 * C_out)
-        self.final_layer = FinalLayerUsecheckpoint(
+        self.final_layer = FinalLayer(
             channels=model_channels,
             patch_size=self.patch_size,
             out_channels=out_channels,
-            use_checkpoint=self.use_checkpoint
+            use_checkpoint=self.use_checkpoint,
+            use_rmsnorm=self.use_rmsnorm,
         )
         
         self.unpatchify = VolumeUnembedder(
@@ -416,7 +440,7 @@ class CaloLightningDiT(nn.Module):
 
             # Zero-out adaLN modulation layers in DiT blocks:
             if self.share_mod:
-                nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+                nn.init.normal_(self.adaLN_modulation[-1].weight, std=0.02)
                 nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
             else:
                 for block in self.blocks:
@@ -428,9 +452,9 @@ class CaloLightningDiT(nn.Module):
             nn.init.constant_(self.final_layer.linear.weight, 0)
             nn.init.constant_(self.final_layer.linear.bias, 0)
 
-            if hasattr(self.final_layer, 'adaLN_modulation'):
-                nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-                nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+            # if hasattr(self.final_layer, 'adaLN_modulation'):
+            #     nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+            #     nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
 
         elif self.initialization == 'scaled':
             # Initialize transformer layers:
