@@ -59,24 +59,57 @@ class TimestepEmbedder(nn.Module):
 
     @torch.compile
     def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size).to(self.dtype)
         t_emb = self.mlp(t_freq)
         return t_emb
 
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
 
-class ConditionEmbedder(nn.Module):
-    def __init__(self, input_size, hidden_size):
+
+class ContinuousConditionEmbedder(TimestepEmbedder):
+    """
+    PixArt-style embedder for continuous conditions.
+
+    Each scalar entry is embedded independently with the same sinusoidal
+    frequency basis used for timesteps, then the per-dimension embeddings are
+    concatenated back together. For an input of shape `(B, D_in)`, the output
+    shape is `(B, D_in * hidden_size)`.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__(hidden_size=hidden_size, frequency_embedding_size=frequency_embedding_size)
+        self.outdim = hidden_size
+
+    @torch.compile
+    def forward(self, s, bs: Optional[int] = None):
+        if s.ndim == 1:
+            s = s[:, None]
+        if s.ndim != 2:
+            # here we can take (B, D_in)
+            raise ValueError(f"Expected a 2D condition tensor, got shape {tuple(s.shape)}.")
+
+        if bs is None:
+            bs = s.shape[0]
+        if s.shape[0] != bs:
+            if bs % s.shape[0] != 0:
+                raise ValueError(f"Cannot broadcast condition batch {s.shape[0]} to target batch {bs}.")
+            s = s.repeat(bs // s.shape[0], 1)
+
+        batch_size, dims = s.shape
+        s = s.reshape(batch_size * dims)
+        s_freq = self.timestep_embedding(s, self.frequency_embedding_size).to(self.dtype)
+        s_emb = self.mlp(s_freq)
+        return s_emb.reshape(batch_size, dims * self.outdim)
+
+
+class DiscreteConditionEmbedder(nn.Module):
+    def __init__(self, num_embeddings, hidden_size):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-        )
+        self.embedding = nn.Embedding(num_embeddings, hidden_size)
 
     def forward(self, x):
-        return self.mlp(x)
+        return self.embedding(x)
 
 
 class CaloLightningDiTBlock(nn.Module):
@@ -170,7 +203,18 @@ class CaloLightningDiTBlock(nn.Module):
 
 class FinalLayer(nn.Module):
     """
-    Condition injected final layer with adaptive layer norm conditioning.
+    Final token-to-patch prediction head for CaloLightningDiT.
+
+    The layer first normalizes each token, then uses AdaLN-style conditioning
+    to produce per-sample shift, scale, and gate parameters from the global
+    modulation vector. The normalized tokens are affine-modulated, blended
+    with the original tokens through a sigmoid gate, and finally projected to
+    `patch_volume * out_channels` so they can be unpatchified back into the
+    3D calorimeter volume.
+
+    Compared with the vanilla DiT output head, this version keeps an explicit
+    gated interpolation between the residual stream and the conditioned branch
+    before the final linear projection.
     """
     def __init__(
         self,
@@ -346,11 +390,27 @@ class CaloLightningDiT(nn.Module):
         # 5. 其他组件初始化
         # ----------------------------------------------------------------
         self.t_embedder = TimestepEmbedder(model_channels)
-        
-        # ConditionEmbedder dont support class-free guidance !!
-        self.c_embedders = nn.ModuleList([
-            ConditionEmbedder(c_size, model_channels) for c_size in self.conditions_size
-        ])
+        self.num_condition_components = len(self.conditions_size)
+        if self.num_condition_components not in (3, 4):
+            raise ValueError(
+                "CaloLightningDiT expects 3 continuous conditions "
+                "(energy, phi, theta) with an optional 4th discrete label condition."
+            )
+        self.has_label_condition = self.num_condition_components == 4
+        self.num_continuous_condition_dims = sum(self.conditions_size[:3])
+        self.num_condition_slots = self.num_continuous_condition_dims + int(self.has_label_condition)
+
+        # Each scalar continuous variable occupies one equal-width slot after embedding.
+        # Any leftover channels are padded with zeros after concatenation.
+        self.condition_slot_dim = self.model_channels // self.num_condition_slots
+        self.condition_pad_dim = self.model_channels - self.condition_slot_dim * self.num_condition_slots
+        self.energy_embedder = ContinuousConditionEmbedder(self.condition_slot_dim)
+        self.phi_embedder = ContinuousConditionEmbedder(self.condition_slot_dim)
+        self.theta_embedder = ContinuousConditionEmbedder(self.condition_slot_dim)
+        if self.has_label_condition:
+            self.label_embedder = DiscreteConditionEmbedder(self.conditions_size[3], self.condition_slot_dim)
+        else:
+            self.label_embedder = None
 
         # 共享调制层 (如果启用)
         if share_mod:
@@ -430,11 +490,12 @@ class CaloLightningDiT(nn.Module):
             nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
             nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-            # Initialize condition embedding MLPs:
-            for c_embedder in self.c_embedders:
-                for module in c_embedder.modules():
-                    if isinstance(module, nn.Linear):
-                        nn.init.normal_(module.weight, std=0.02)
+            # Initialize condition embedders:
+            for c_embedder in (self.energy_embedder, self.phi_embedder, self.theta_embedder):
+                nn.init.normal_(c_embedder.mlp[0].weight, std=0.02)
+                nn.init.normal_(c_embedder.mlp[2].weight, std=0.02)
+            if self.label_embedder is not None:
+                nn.init.normal_(self.label_embedder.embedding.weight, std=0.02)
 
             # share_mod modulation initialize ? if grad boom maybe i should initialize them to 0
 
@@ -460,21 +521,49 @@ class CaloLightningDiT(nn.Module):
             # Initialize transformer layers:
             pass
 
+    def _embed_label_condition(self, label: torch.Tensor) -> torch.Tensor:
+        if self.label_embedder is None:
+            raise RuntimeError("Label embedder is not initialized for this model.")
+        if label.shape[-1] == 1:
+            label_ids = label.reshape(-1).long()
+        else:
+            label_ids = label.argmax(dim=-1).long()
+        return self.label_embedder(label_ids)
+
+    def _embed_conditions(self, c: Tuple[torch.Tensor, ...]) -> torch.Tensor:
+        if len(c) != self.num_condition_components:
+            raise ValueError(
+                f"Expected {self.num_condition_components} condition tensors, got {len(c)}."
+            )
+
+        condition_embs = [
+            self.energy_embedder(c[0], bs=c[0].shape[0]),
+            self.phi_embedder(c[1], bs=c[0].shape[0]),
+            self.theta_embedder(c[2], bs=c[0].shape[0]),
+        ]
+        if self.has_label_condition:
+            condition_embs.append(self._embed_label_condition(c[3]))
+        condition_emb = torch.cat(condition_embs, dim=-1)
+        if self.condition_pad_dim > 0:
+            condition_emb = torch.nn.functional.pad(condition_emb, (0, self.condition_pad_dim))
+        return condition_emb
+
     def forward(self, x: torch.Tensor, c: Tuple[torch.Tensor, ...], t: torch.Tensor):
             """
             x: (N, in_channels, R, PHI, Z) tensor of showers
-            c: ((N, 1), (N, 2), (N, 1)) tuple of conditioning tensors
+            c: ((N, 1), (N, 2), (N, 1)) or ((N, 1), (N, 2), (N, 1), (N, K))
+               tuple of conditioning tensors
             t: (N,) tensor of diffusion timesteps
             """
             # 1. 计算基础 Embeddings
             t_emb = self.t_embedder(t) # Shape: (N, D)
-            
-            # 处理条件元组 c
-            c_embs = [c_embedder(c_i) for c_embedder, c_i in zip(self.c_embedders, c)]
-            
+
+            # 条件元组使用独立的 embedder 编码，并沿特征维做等宽拼接
+            c_cond = self._embed_conditions(c)
+
             # 2. 生成全局原始条件向量 (Global Conditioning Vector)
-            # Shape: (N, D)，这是未经投影的原始特征空间
-            c_global = t_emb + sum(c_embs) 
+            # 条件之间不再相加，而是先 concat，再与 timestep embedding 融合
+            c_global = t_emb + c_cond
 
             # 3. 准备骨干网络专用条件 (Backbone Conditioning)
             if self.share_mod:
@@ -513,6 +602,13 @@ class CaloLightningDiT(nn.Module):
     @property
     def example_input(self):
         x = torch.randn(1, self.in_channels, *self.input_size)
-        c = tuple(torch.randn(1, dim) for dim in self.conditions_size)
+        c = []
+        for idx, dim in enumerate(self.conditions_size):
+            if self.has_label_condition and idx == len(self.conditions_size) - 1:
+                label = torch.zeros(1, dim)
+                label[0, 0] = 1
+                c.append(label)
+            else:
+                c.append(torch.randn(1, dim))
         t = torch.randn(1)
-        return (x, c, t)
+        return (x, tuple(c), t)

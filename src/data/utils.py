@@ -22,7 +22,8 @@ def load_showers(file_path: Union[str, Path], showers: np.ndarray, energy: np.nd
 
             # shape mismatch for read_direct
             arr = np.empty((end_idx - start_idx, 1), dtype=np.float32)
-            f["incident_energies"].read_direct(arr)
+            f["incident_energies"].read_direct(arr)            
+            # only energy here
             energy[start_idx:end_idx] = arr.flatten()
             # leave theta and phi as zeros
 

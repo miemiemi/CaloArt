@@ -90,15 +90,18 @@ def setup_accelerator(cpu: bool = False, mixed_precision: str = "none", single_c
         os.environ["OPENBLAS_NUM_THREADS"] = "1"
         torch.set_num_threads(1)
 
+    if not cpu:
+        torch.set_float32_matmul_precision("high")
+
     # keep split_batches unchanged; resuming a run with different resources and split_batches=False can modify batches_per_epoch
     # Edit: split_batches won't make a difference if dispatch_batches is True
-    # do not remove find_unused_parameters, it is necessary for DDP to work properly: https://github.com/pytorch/pytorch/issues/43259
+    # keep DDP unused-parameter detection disabled unless a model actually requires it
     accelerator = Accelerator(
         cpu=cpu,
         mixed_precision=mixed_precision,
         dataloader_config=DataLoaderConfiguration(),
         kwargs_handlers=[
-            DistributedDataParallelKwargs(find_unused_parameters=True),
+            DistributedDataParallelKwargs(find_unused_parameters=False),
             InitProcessGroupKwargs(timeout=timedelta(seconds=5400))
         ],
     )
