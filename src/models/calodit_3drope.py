@@ -77,11 +77,22 @@ class ContinuousConditionEmbedder(TimestepEmbedder):
     concatenated back together. For an input of shape `(B, D_in)`, the output
     shape is `(B, D_in * hidden_size)`.
     """
-    def __init__(self, hidden_size, frequency_embedding_size=256):
-        super().__init__(hidden_size=hidden_size, frequency_embedding_size=frequency_embedding_size)
-        self.outdim = hidden_size
+    def __init__(self, input_size, hidden_size, frequency_embedding_size=256):
+        if hidden_size % input_size != 0:
+            raise ValueError(
+                f"Continuous condition output dim {hidden_size} must be divisible by "
+                f"its input size {input_size} ."
+            )
+        super().__init__(
+            hidden_size=hidden_size // input_size,
+            frequency_embedding_size=frequency_embedding_size,
+        )
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        # self.outdim is call outdim because PixArt called it, its not the final output size
 
-    @torch.compile
+        self.outdim = hidden_size // input_size 
+        
     def forward(self, s, bs: Optional[int] = None):
         if s.ndim == 1:
             s = s[:, None]
@@ -95,6 +106,11 @@ class ContinuousConditionEmbedder(TimestepEmbedder):
             if bs % s.shape[0] != 0:
                 raise ValueError(f"Cannot broadcast condition batch {s.shape[0]} to target batch {bs}.")
             s = s.repeat(bs // s.shape[0], 1)
+
+        if s.shape[1] != self.input_size:
+            raise ValueError(
+                f"Expected condition width {self.input_size}, got {s.shape[1]}."
+            )
 
         batch_size, dims = s.shape
         s = s.reshape(batch_size * dims)
@@ -308,6 +324,7 @@ class CaloLightningDiT(nn.Module):
         proj_drop: float = 0.0,
         use_rmsnorm: bool = False,
         use_conv: bool = False,
+        condition_embed_dims: Optional[Sequence[int]] = None,
         **kwargs
     ):
         super().__init__()
@@ -391,24 +408,24 @@ class CaloLightningDiT(nn.Module):
         # ----------------------------------------------------------------
         self.t_embedder = TimestepEmbedder(model_channels)
         self.num_condition_components = len(self.conditions_size)
-        if self.num_condition_components not in (3, 4):
-            raise ValueError(
-                "CaloLightningDiT expects 3 continuous conditions "
-                "(energy, phi, theta) with an optional 4th discrete label condition."
-            )
         self.has_label_condition = self.num_condition_components == 4
-        self.num_continuous_condition_dims = sum(self.conditions_size[:3])
-        self.num_condition_slots = self.num_continuous_condition_dims + int(self.has_label_condition)
+        self.condition_embed_dims = tuple(int(dim) for dim in condition_embed_dims)
+        assert len(self.condition_embed_dims) == self.num_condition_components
+        assert sum(self.condition_embed_dims) == self.model_channels
 
-        # Each scalar continuous variable occupies one equal-width slot after embedding.
-        # Any leftover channels are padded with zeros after concatenation.
-        self.condition_slot_dim = self.model_channels // self.num_condition_slots
-        self.condition_pad_dim = self.model_channels - self.condition_slot_dim * self.num_condition_slots
-        self.energy_embedder = ContinuousConditionEmbedder(self.condition_slot_dim)
-        self.phi_embedder = ContinuousConditionEmbedder(self.condition_slot_dim)
-        self.theta_embedder = ContinuousConditionEmbedder(self.condition_slot_dim)
+        self.energy_embedder = ContinuousConditionEmbedder(
+            self.conditions_size[0], self.condition_embed_dims[0]
+        )
+        self.phi_embedder = ContinuousConditionEmbedder(
+            self.conditions_size[1], self.condition_embed_dims[1]
+        )
+        self.theta_embedder = ContinuousConditionEmbedder(
+            self.conditions_size[2], self.condition_embed_dims[2]
+        )
         if self.has_label_condition:
-            self.label_embedder = DiscreteConditionEmbedder(self.conditions_size[3], self.condition_slot_dim)
+            self.label_embedder = DiscreteConditionEmbedder(
+                self.conditions_size[3], self.condition_embed_dims[3]
+            )
         else:
             self.label_embedder = None
 
@@ -543,10 +560,7 @@ class CaloLightningDiT(nn.Module):
         ]
         if self.has_label_condition:
             condition_embs.append(self._embed_label_condition(c[3]))
-        condition_emb = torch.cat(condition_embs, dim=-1)
-        if self.condition_pad_dim > 0:
-            condition_emb = torch.nn.functional.pad(condition_emb, (0, self.condition_pad_dim))
-        return condition_emb
+        return torch.cat(condition_embs, dim=-1)
 
     def forward(self, x: torch.Tensor, c: Tuple[torch.Tensor, ...], t: torch.Tensor):
             """
