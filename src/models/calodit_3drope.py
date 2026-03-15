@@ -313,7 +313,7 @@ class CaloLightningDiT(nn.Module):
         num_heads: Optional[int] = None,
         num_head_channels: Optional[int] = 64,
         mlp_ratio: float = 4.0,
-        pe_mode: Literal["ape", "rope"] = "ape",
+        pe_mode: Literal["ape", "rope", "ape+rope"] = "ape",
         rope_freq: Tuple[float, float] = (1.0, 10000.0),
         dtype: str = 'float32',
         use_checkpoint: bool = False,
@@ -365,42 +365,34 @@ class CaloLightningDiT(nn.Module):
 
         # ----------------------------------------------------------------
         # 4. 位置编码逻辑 (Position Embedding)
+        # 支持三种模式："ape" / "rope" / "ape+rope"
+        # 参考 JiT (Lightning-DiT)：APE 加到 token, RoPE 旋转 Q/K，两者可共存
         # ----------------------------------------------------------------
-        if pe_mode == "ape":
-            # Absolute Position Embedding
-            # 假设 AbsolutePositionEmbedder 接受 (dim, 3) 作为输入
-            pos_embedder = AbsolutePositionEmbedder(model_channels, 3)
-            
-            # 生成 3D 网格坐标
-            coords = torch.meshgrid(
-                *[torch.arange(s) for s in self.grid_size], 
-                indexing='ij'
-            )
-            # stack -> (D, H, W, 3) -> flatten -> (N_patches, 3)
-            coords = torch.stack(coords, dim=-1).reshape(-1, 3)
-            
-            # 计算 embedding
-            pos_emb = pos_embedder(coords) # (N_patches, model_channels)
-            
-            # 注册为 Buffer (不会被优化器更新，但会随模型保存和移动设备)
-            self.register_buffer("pos_emb", pos_emb.unsqueeze(0)) # (1, N, D)
+        self._use_ape = pe_mode in ("ape", "ape+rope")
+        self._use_rope = pe_mode in ("rope", "ape+rope")
 
-        elif pe_mode == "rope":
-            # Rotary Position Embedding
-            # RoPE 不需要可学习参数，它在 forward 中实时计算，这里预计算频率/相位
-            pos_embedder = RotaryPositionEmbedder(self.model_channels // self.num_heads, 3)
-            
-            coords = torch.meshgrid(
-                *[torch.arange(s) for s in self.grid_size], 
-                indexing='ij'
-            )
-            coords = torch.stack(coords, dim=-1).reshape(-1, 3)
-            
-            # 获取 RoPE 需要的预计算相位/频率表
-            rope_phases = pos_embedder(coords) 
+        # 生成 3D 网格坐标 (APE / RoPE 都需要)
+        coords = torch.meshgrid(
+            *[torch.arange(s) for s in self.grid_size],
+            indexing='ij'
+        )
+        # stack -> (D, H, W, 3) -> flatten -> (N_patches, 3)
+        coords = torch.stack(coords, dim=-1).reshape(-1, 3)
+
+        if self._use_ape:
+            # Absolute Position Embedding
+            pos_embedder = AbsolutePositionEmbedder(model_channels, 3)
+            pos_emb = pos_embedder(coords)  # (N_patches, model_channels)
+            self.register_buffer("pos_emb", pos_emb.unsqueeze(0))  # (1, N, D)
+        else:
+            self.pos_emb = None
+
+        if self._use_rope:
+            # Rotary Position Embedding — 预计算相位/频率表
+            rope_embedder = RotaryPositionEmbedder(self.model_channels // self.num_heads, 3)
+            rope_phases = rope_embedder(coords)
             self.register_buffer("rope_phases", rope_phases)
-        
-        if pe_mode != "rope":
+        else:
             self.rope_phases = None
 
         # ----------------------------------------------------------------
@@ -444,7 +436,7 @@ class CaloLightningDiT(nn.Module):
                 mlp_ratio=self.mlp_ratio,
                 attn_mode='full',
                 use_checkpoint=self.use_checkpoint,
-                use_rope=(pe_mode == "rope"),
+                use_rope=self._use_rope,
                 rope_freq=rope_freq, # Block 内部通常不需要 freq，只需要 rope_phases，视具体实现而定
                 share_mod=share_mod,
                 qk_rms_norm=self.qk_rms_norm,
@@ -591,12 +583,12 @@ class CaloLightningDiT(nn.Module):
             x = self.patch_embedder(x)
 
             # 5. 位置编码处理
-            # APE 模式：直接相加
-            if self.pe_mode == 'ape':
+            # APE：直接加到 token embedding 上
+            if self._use_ape:
                 x = x + self.pos_emb
-            
-            # RoPE 模式：准备相位信息传给 Attention
-            rope = self.rope_phases if self.pe_mode == 'rope' else None
+
+            # RoPE：准备相位信息传给 Attention（Q/K 旋转）
+            rope = self.rope_phases if self._use_rope else None
 
             # 6. Transformer Blocks 循环
             # 关键点：这里传入 c_backbone
