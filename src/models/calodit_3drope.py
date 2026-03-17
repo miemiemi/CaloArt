@@ -68,45 +68,107 @@ class TimestepEmbedder(nn.Module):
         return next(self.parameters()).dtype
 
 
-class ConditionEmbedder(nn.Module):
+class ContinuousConditionEmbedder(TimestepEmbedder):
     """
-    Plain MLP embedder for continuous conditions.
+    PixArt-style embedder for continuous conditions.
 
-    This keeps the current condition concatenation path unchanged while
-    replacing the sinusoidal per-dimension embedding with a direct projection
-    from the full condition vector to the target hidden size.
+    Each scalar entry is embedded independently with the same sinusoidal
+    frequency basis used for timesteps, then the per-dimension embeddings are
+    concatenated back together. For an input of shape `(B, D_in)`, the output
+    shape is `(B, D_in * hidden_size)`.
     """
-    def __init__(self, input_size, hidden_size):
+    def __init__(self, input_size, hidden_size, frequency_embedding_size=256):
+        if hidden_size % input_size != 0:
+            raise ValueError(
+                f"Continuous condition output dim {hidden_size} must be divisible by "
+                f"its input size {input_size} ."
+            )
+        super().__init__(
+            hidden_size=hidden_size // input_size,
+            frequency_embedding_size=frequency_embedding_size,
+        )
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        # self.outdim is call outdim because PixArt called it, its not the final output size
+
+        self.outdim = hidden_size // input_size
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, self.outdim, bias=True),
+            nn.SiLU(),
+            nn.Linear(self.outdim, self.outdim, bias=True),
+            nn.SiLU(),
+            nn.Linear(self.outdim, self.outdim, bias=True),
+        )
+        
+    def forward(self, s, bs: Optional[int] = None):
+        if s.ndim == 1:
+            s = s[:, None]
+        if s.ndim != 2:
+            # here we can take (B, D_in)
+            raise ValueError(f"Expected a 2D condition tensor, got shape {tuple(s.shape)}.")
+
+        if bs is None:
+            bs = s.shape[0]
+        if s.shape[0] != bs:
+            if bs % s.shape[0] != 0:
+                raise ValueError(f"Cannot broadcast condition batch {s.shape[0]} to target batch {bs}.")
+            s = s.repeat(bs // s.shape[0], 1)
+
+        if s.shape[1] != self.input_size:
+            raise ValueError(
+                f"Expected condition width {self.input_size}, got {s.shape[1]}."
+            )
+
+        batch_size, dims = s.shape
+        s = s.reshape(batch_size * dims)
+        s_freq = self.timestep_embedding(s, self.frequency_embedding_size).to(self.dtype)
+        s_emb = self.mlp(s_freq)
+        return s_emb.reshape(batch_size, dims * self.outdim)
+
+
+class MLPConditionEmbedder(nn.Module):
+    """
+    Joint MLP embedder for continuous conditions.
+
+    Unlike ``ContinuousConditionEmbedder``, this module consumes the full
+    condition vector at once. This is useful for scalar conditions or small
+    low-dimensional tuples whose cross-dimension interactions should be learned
+    directly by the first linear layer.
+    """
+    def __init__(self, input_size, hidden_size, intermediate_size: Optional[int] = None):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
+        self.intermediate_size = hidden_size if intermediate_size is None else intermediate_size
         self.mlp = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
+            nn.Linear(input_size, self.intermediate_size, bias=True),
             nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
+            nn.Linear(self.intermediate_size, hidden_size, bias=True),
         )
 
-    def forward(self, x: torch.Tensor, bs: Optional[int] = None) -> torch.Tensor:
-        if x.ndim == 1:
-            x = x[:, None]
-        if x.ndim != 2:
-            raise ValueError(f"Expected a 2D condition tensor, got shape {tuple(x.shape)}.")
-
-        if bs is None:
-            bs = x.shape[0]
-        if x.shape[0] != bs:
-            if bs % x.shape[0] != 0:
-                raise ValueError(f"Cannot broadcast condition batch {x.shape[0]} to target batch {bs}.")
-            x = x.repeat(bs // x.shape[0], 1)
-
-        if x.shape[1] != self.input_size:
+    def forward(self, s):
+        if s.ndim == 1:
+            s = s[:, None]
+        if s.shape[-1] != self.input_size:
             raise ValueError(
-                f"Expected condition width {self.input_size}, got {x.shape[1]}."
+                f"Expected condition width {self.input_size}, got {s.shape[-1]}."
             )
+        return self.mlp(s.to(self.dtype))
 
-        return self.mlp(x)
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+
+
+def _module_grad_l2_norm(module: Optional[nn.Module], device: torch.device) -> torch.Tensor:
+    if module is None:
+        return torch.zeros((), device=device)
+
+    sq_norm = torch.zeros((), device=device)
+    for param in module.parameters():
+        if param.grad is not None:
+            sq_norm = sq_norm + param.grad.detach().float().pow(2).sum()
+    return sq_norm.sqrt()
 
 
 class DiscreteConditionEmbedder(nn.Module):
@@ -391,19 +453,28 @@ class CaloLightningDiT(nn.Module):
         self.t_embedder = TimestepEmbedder(model_channels)
         self.num_condition_components = len(self.conditions_size)
         self.has_label_condition = self.num_condition_components == 4
+        if self.num_condition_components not in (1, 3, 4):
+            raise ValueError(
+                f"Unsupported number of condition tensors: {self.num_condition_components}. "
+                "Expected 1 (energy-only), 3 (energy/phi/theta), or 4 (plus label)."
+            )
         self.condition_embed_dims = tuple(int(dim) for dim in condition_embed_dims)
         assert len(self.condition_embed_dims) == self.num_condition_components
         assert sum(self.condition_embed_dims) == self.model_channels
 
-        self.energy_embedder = ConditionEmbedder(
+        self.energy_embedder = MLPConditionEmbedder(
             self.conditions_size[0], self.condition_embed_dims[0]
         )
-        self.phi_embedder = ConditionEmbedder(
-            self.conditions_size[1], self.condition_embed_dims[1]
-        )
-        self.theta_embedder = ConditionEmbedder(
-            self.conditions_size[2], self.condition_embed_dims[2]
-        )
+        if self.num_condition_components >= 3:
+            self.phi_embedder = MLPConditionEmbedder(
+                self.conditions_size[1], self.condition_embed_dims[1]
+            )
+            self.theta_embedder = MLPConditionEmbedder(
+                self.conditions_size[2], self.condition_embed_dims[2]
+            )
+        else:
+            self.phi_embedder = None
+            self.theta_embedder = None
         if self.has_label_condition:
             self.label_embedder = DiscreteConditionEmbedder(
                 self.conditions_size[3], self.condition_embed_dims[3]
@@ -490,10 +561,20 @@ class CaloLightningDiT(nn.Module):
             nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
             # Initialize condition embedders:
+            def _init_condition_embedder(embedder: Optional[nn.Module]) -> None:
+                if embedder is None:
+                    return
+                # Keep the default/Xavier-style init for joint MLP condition encoders.
+                if isinstance(embedder, MLPConditionEmbedder):
+                    return
+                for module in embedder.mlp:
+                    if isinstance(module, nn.Linear):
+                        nn.init.normal_(module.weight, std=0.02)
+                        if module.bias is not None:
+                            nn.init.constant_(module.bias, 0)
+
             for c_embedder in (self.energy_embedder, self.phi_embedder, self.theta_embedder):
-                nn.init.normal_(c_embedder.mlp[0].weight, std=0.02)
-                nn.init.normal_(c_embedder.mlp[2].weight, std=0.02)
-                nn.init.normal_(c_embedder.mlp[4].weight, std=0.02)
+                _init_condition_embedder(c_embedder)
             if self.label_embedder is not None:
                 nn.init.normal_(self.label_embedder.embedding.weight, std=0.02)
 
@@ -536,11 +617,12 @@ class CaloLightningDiT(nn.Module):
                 f"Expected {self.num_condition_components} condition tensors, got {len(c)}."
             )
 
-        condition_embs = [
-            self.energy_embedder(c[0], bs=c[0].shape[0]),
-            self.phi_embedder(c[1], bs=c[0].shape[0]),
-            self.theta_embedder(c[2], bs=c[0].shape[0]),
-        ]
+        condition_embs = [self.energy_embedder(c[0])]
+        if self.phi_embedder is not None and self.theta_embedder is not None:
+            condition_embs.extend([
+                self.phi_embedder(c[1]),
+                self.theta_embedder(c[2]),
+            ])
         if self.has_label_condition:
             condition_embs.append(self._embed_label_condition(c[3]))
         return torch.cat(condition_embs, dim=-1)
@@ -548,7 +630,7 @@ class CaloLightningDiT(nn.Module):
     def forward(self, x: torch.Tensor, c: Tuple[torch.Tensor, ...], t: torch.Tensor):
             """
             x: (N, in_channels, R, PHI, Z) tensor of showers
-            c: ((N, 1), (N, 2), (N, 1)) or ((N, 1), (N, 2), (N, 1), (N, K))
+            c: ((N, 1),) or ((N, 1), (N, 2), (N, 1)) or ((N, 1), (N, 2), (N, 1), (N, K))
                tuple of conditioning tensors
             t: (N,) tensor of diffusion timesteps
             """

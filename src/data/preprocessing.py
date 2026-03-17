@@ -162,6 +162,15 @@ class ShowerPreprocessor:
 
 
 class ConditionsPreprocessor:
+    def __init__(self, keep_condition_components=None):
+        self.keep_condition_components = None
+        if keep_condition_components is not None:
+            self.keep_condition_components = tuple(keep_condition_components)
+            valid_components = {"energy", "phi", "theta", "geo"}
+            invalid_components = set(self.keep_condition_components) - valid_components
+            if invalid_components:
+                raise ValueError(f"Unsupported condition components: {sorted(invalid_components)}")
+
     def _transform_energy(self, energy):
         energy_min = 1  # after division by 1000
         energy_max = 1000  # after division by 1000
@@ -199,41 +208,75 @@ class ConditionsPreprocessor:
         phi_from_sin = torch.arcsin(sin_phi)
         return phi_from_sin
 
+    def _select_components(self, components):
+        if self.keep_condition_components is None:
+            return tuple(components.values())
+        selected = []
+        for key in self.keep_condition_components:
+            if key not in components:
+                raise ValueError(f"Requested condition component '{key}' is unavailable.")
+            selected.append(components[key])
+        return tuple(selected)
+
     def transform(self, conditions):
         geo = None
         if len(conditions)==4:
             energy, phi, theta, geo = conditions
+        elif len(conditions) == 1:
+            (energy,) = conditions
+            phi = theta = None
         else:
             energy, phi, theta = conditions
-        energy = self._transform_energy(energy)
-        phi = self._transform_phi(phi)
-        theta = self._transform_theta(theta)
-        energy = energy.reshape(-1, 1)
-        phi = phi.reshape(-1, 2)  # transformed phi is 2D
-        theta = theta.reshape(-1, 1)
+        components = {
+            "energy": self._transform_energy(energy).reshape(-1, 1),
+        }
+        if phi is not None:
+            components["phi"] = self._transform_phi(phi).reshape(-1, 2)
+        if theta is not None:
+            components["theta"] = self._transform_theta(theta).reshape(-1, 1)
         if geo is not None:
-            geo = geo.reshape(-1, 5)
-            return energy, phi, theta, geo
+            components["geo"] = geo.reshape(-1, 5)
 
-        return energy, phi, theta
+        return self._select_components(components)
 
     def inverse_transform(self, conditions):
-        geo = None
-        if len(conditions)==4:
-            energy, phi, theta, geo = conditions
+        components = {}
+        include_geo_in_output = self.keep_condition_components is not None and "geo" in self.keep_condition_components
+        if self.keep_condition_components is None:
+            if len(conditions) == 1:
+                component_keys = ("energy",)
+            elif len(conditions) == 3:
+                component_keys = ("energy", "phi", "theta")
+            elif len(conditions) == 4:
+                component_keys = ("energy", "phi", "theta", "geo")
+            else:
+                raise ValueError(f"Cannot infer condition names from {len(conditions)} transformed tensors.")
         else:
-            energy, phi, theta = conditions
-        energy = self._inverse_transform_energy(energy)
-        phi = self._inverse_transform_phi(phi)
-        theta = self._inverse_transform_theta(theta)
+            component_keys = self.keep_condition_components
+            if len(conditions) != len(component_keys):
+                raise ValueError(
+                    f"Expected {len(component_keys)} transformed conditions, got {len(conditions)}."
+                )
+        for key, value in zip(component_keys, conditions):
+            components[key] = value
 
-        return energy, phi, theta
+        outputs = []
+        if "energy" in components:
+            outputs.append(self._inverse_transform_energy(components["energy"]))
+        if "phi" in components:
+            outputs.append(self._inverse_transform_phi(components["phi"]))
+        if "theta" in components:
+            outputs.append(self._inverse_transform_theta(components["theta"]))
+        if include_geo_in_output and "geo" in components:
+            outputs.append(components["geo"])
+
+        return tuple(outputs)
 
 
 class CaloShowerPreprocessor:
-    def __init__(self, steps):
+    def __init__(self, steps, keep_condition_components=None):
         self.shower_preprocessor = ShowerPreprocessor(steps)
-        self.conditions_preprocessor = ConditionsPreprocessor()
+        self.conditions_preprocessor = ConditionsPreprocessor(keep_condition_components=keep_condition_components)
 
     def transform(self, showers=None, conditions=None):
         if showers is not None and conditions is not None:
