@@ -72,6 +72,8 @@ class FlowMatching(MethodBase):
         self.t_eps = t_eps
         self.num_sample_steps = num_sample_steps
         self.solver = solver
+        self.record_condition_diagnostics = False
+        self._last_condition_diagnostics = None
 
     # ------------------------------------------------------------------ #
     #                         Time sampling                                #
@@ -178,6 +180,9 @@ class FlowMatching(MethodBase):
         # 4. Ground truth velocity
         v_target = x_1 - x_0
 
+        if self.record_condition_diagnostics and hasattr(self.model, "compute_condition_diagnostics"):
+            self._last_condition_diagnostics = self.model.compute_condition_diagnostics(x_cond, t)
+
         # 5. Model prediction (interpretation depends on predict_mode)
         raw_pred = self.model(z_t, x_cond, t)
 
@@ -191,6 +196,14 @@ class FlowMatching(MethodBase):
         # 8. MSE loss
         losses = mean_flat((pred_in_loss_space - target_in_loss_space) ** 2)
         return losses.mean()
+
+    def get_condition_diagnostics(self):
+        return self._last_condition_diagnostics
+
+    def get_condition_gradient_diagnostics(self):
+        if hasattr(self.model, "compute_condition_gradient_diagnostics"):
+            return self.model.compute_condition_gradient_diagnostics()
+        return {}
 
     # ------------------------------------------------------------------ #
     #                        Sampling (inference)                           #

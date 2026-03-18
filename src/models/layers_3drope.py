@@ -206,3 +206,51 @@ class RMSNorm32(nn.Module):
         if self.weight is not None:
             x = x * self.weight
         return manual_cast(x, x_dtype)
+
+
+def t2i_modulate(x, shift, scale):
+    return x * (1 + scale) + shift
+
+class PixArtFinalLayer(nn.Module):
+    """
+    PixArt-style final head adapted to the 3D CaloDiT stack.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        patch_size,
+        out_channels: int,
+        use_checkpoint: bool = False,
+        use_rmsnorm: bool = False,
+    ):
+        super().__init__()
+        self.use_checkpoint = use_checkpoint
+        self.use_rmsnorm = use_rmsnorm
+
+        if not use_rmsnorm:
+            self.norm_final = LayerNorm32(hidden_size, elementwise_affine=False, eps=1e-6)
+        else:
+            self.norm_final = RMSNorm32(hidden_size, eps=1e-6)
+
+        if isinstance(patch_size, int):
+            patch_vol = patch_size
+        else:
+            patch_vol = math.prod(patch_size)
+
+        self.linear = nn.Linear(hidden_size, patch_vol * out_channels, bias=True)
+        self.scale_shift_table = nn.Parameter(torch.randn(2, hidden_size) / hidden_size ** 0.5)
+        self.out_channels = out_channels
+
+    def _forward(self, x: torch.Tensor, mod: torch.Tensor) -> torch.Tensor:
+        shift, scale = (self.scale_shift_table[None] + mod[:, None]).chunk(2, dim=1)
+        x = t2i_modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x
+
+    @torch.compile
+    def forward(self, x: torch.Tensor, mod: torch.Tensor) -> torch.Tensor:
+        if self.use_checkpoint:
+            return torch.utils.checkpoint.checkpoint(self._forward, x, mod, use_reentrant=False)
+        return self._forward(x, mod)
+    

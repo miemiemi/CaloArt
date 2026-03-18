@@ -17,6 +17,7 @@ from src.models.layers_3drope import (
     SwiGLUFFN,
     VolumeEmbedder,
     VolumeUnembedder,
+    PixArtFinalLayer
 )
 
 class TimestepEmbedder(nn.Module):
@@ -301,7 +302,7 @@ class FinalLayer(nn.Module):
             self.norm_final = RMSNorm32(channels, eps=1e-6)
             
         if isinstance(patch_size, int):
-            patch_vol = patch_size
+            patch_vol = patch_size # may cause bug here shit code
         else:
             patch_vol = math.prod(patch_size)
 
@@ -377,6 +378,7 @@ class CaloLightningDiT(nn.Module):
         use_rmsnorm: bool = False,
         use_conv: bool = False,
         condition_embed_dims: Optional[Sequence[int]] = None,
+        condition_embed_init: Literal["auto", "legacy_timestep_like"] = "auto",
         **kwargs
     ):
         super().__init__()
@@ -399,6 +401,7 @@ class CaloLightningDiT(nn.Module):
         self.proj_drop = proj_drop
         self.use_rmsnorm = use_rmsnorm
         self.dtype = str_to_dtype(dtype) if isinstance(dtype, str) else dtype
+        self.condition_embed_init = condition_embed_init
 
         # 2. 核心修改：先初始化 Patch Embedder
         # 我们直接使用 VolumeEmbedder 来处理 grid_size 的计算逻辑
@@ -510,8 +513,8 @@ class CaloLightningDiT(nn.Module):
 
         # 6. 输出层与 Unpatchify
         # 修正：FinalLayer 的输出必须匹配 Unpatchify 的输入要求 (Patch体积 * C_out)
-        self.final_layer = FinalLayer(
-            channels=model_channels,
+        self.final_layer = PixArtFinalLayer(
+            hidden_size=model_channels,
             patch_size=self.patch_size,
             out_channels=out_channels,
             use_checkpoint=self.use_checkpoint,
@@ -564,8 +567,10 @@ class CaloLightningDiT(nn.Module):
             def _init_condition_embedder(embedder: Optional[nn.Module]) -> None:
                 if embedder is None:
                     return
-                # Keep the default/Xavier-style init for joint MLP condition encoders.
-                if isinstance(embedder, MLPConditionEmbedder):
+                if (
+                    isinstance(embedder, MLPConditionEmbedder)
+                    and self.condition_embed_init == "auto"
+                ):
                     return
                 for module in embedder.mlp:
                     if isinstance(module, nn.Linear):
@@ -626,6 +631,54 @@ class CaloLightningDiT(nn.Module):
         if self.has_label_condition:
             condition_embs.append(self._embed_label_condition(c[3]))
         return torch.cat(condition_embs, dim=-1)
+
+    @staticmethod
+    def _mean_l2_norm(x: torch.Tensor) -> torch.Tensor:
+        return x.detach().float().norm(dim=-1).mean()
+
+    @torch.no_grad()
+    def compute_condition_diagnostics(self, c: Tuple[torch.Tensor, ...], t: torch.Tensor) -> Dict[str, torch.Tensor]:
+        t_emb = self.t_embedder(t)
+        energy_emb = self.energy_embedder(c[0])
+        condition_embs = [energy_emb]
+        diagnostics = {
+            "t_emb_norm": self._mean_l2_norm(t_emb),
+            "energy_emb_norm": self._mean_l2_norm(energy_emb),
+        }
+
+        if self.phi_embedder is not None and self.theta_embedder is not None:
+            phi_emb = self.phi_embedder(c[1])
+            theta_emb = self.theta_embedder(c[2])
+            condition_embs.extend([phi_emb, theta_emb])
+            diagnostics["phi_emb_norm"] = self._mean_l2_norm(phi_emb)
+            diagnostics["theta_emb_norm"] = self._mean_l2_norm(theta_emb)
+
+        if self.has_label_condition:
+            label_emb = self._embed_label_condition(c[3])
+            condition_embs.append(label_emb)
+            diagnostics["label_emb_norm"] = self._mean_l2_norm(label_emb)
+
+        c_cond = torch.cat(condition_embs, dim=-1)
+        c_global = t_emb + c_cond
+        diagnostics["c_cond_norm"] = self._mean_l2_norm(c_cond)
+        diagnostics["c_global_norm"] = self._mean_l2_norm(c_global)
+        diagnostics["c_to_t_ratio"] = diagnostics["c_cond_norm"] / diagnostics["t_emb_norm"].clamp_min(1e-12)
+        return diagnostics
+
+    def compute_condition_gradient_diagnostics(self) -> Dict[str, torch.Tensor]:
+        diagnostics = {
+            "t_embedder_grad_norm": _module_grad_l2_norm(self.t_embedder, self.device),
+            "energy_embedder_grad_norm": _module_grad_l2_norm(self.energy_embedder, self.device),
+        }
+        if self.phi_embedder is not None:
+            diagnostics["phi_embedder_grad_norm"] = _module_grad_l2_norm(self.phi_embedder, self.device)
+        if self.theta_embedder is not None:
+            diagnostics["theta_embedder_grad_norm"] = _module_grad_l2_norm(self.theta_embedder, self.device)
+        if self.label_embedder is not None:
+            diagnostics["label_embedder_grad_norm"] = _module_grad_l2_norm(self.label_embedder, self.device)
+        if self.share_mod:
+            diagnostics["shared_mod_grad_norm"] = _module_grad_l2_norm(self.adaLN_modulation, self.device)
+        return diagnostics
 
     def forward(self, x: torch.Tensor, c: Tuple[torch.Tensor, ...], t: torch.Tensor):
             """

@@ -125,6 +125,9 @@ class DiffusionTrainer(object):
         train_on=[],
         logging_strategy="steps",
         logging_steps=100,
+        log_condition_diagnostics=False,
+        condition_diagnostics_steps=0,
+        condition_diagnostics_every=1,
         save_strategy="epoch",
         save_steps=1,
         save_best_and_last_only=False,
@@ -220,6 +223,9 @@ class DiffusionTrainer(object):
         self.use_ema = self.ema_scheduler is not None
 
         self.sampling_args = sampling_args
+        self.log_condition_diagnostics = log_condition_diagnostics
+        self.condition_diagnostics_steps = condition_diagnostics_steps
+        self.condition_diagnostics_every = condition_diagnostics_every
 
         # files and logging
         self.output_dir = Path(output_dir)
@@ -262,6 +268,8 @@ class DiffusionTrainer(object):
         self.resume_from_checkpoint = Path(resume_from_checkpoint) if resume_from_checkpoint else None
         if self.resume_from_checkpoint:
             self.load_state(self.resume_from_checkpoint)
+
+        unwrap_ddp(self.model).record_condition_diagnostics = self.log_condition_diagnostics
 
     @property
     def device(self):
@@ -309,6 +317,7 @@ class DiffusionTrainer(object):
             self.accelerator.backward(loss)
 
         if self.accelerator.sync_gradients:
+            self._log_condition_diagnostics()
             if self.max_grad_value is not None:
                 self.accelerator.clip_grad_value_(self.model.parameters(), self.max_grad_value)
             if self.max_grad_norm is not None:
@@ -332,6 +341,42 @@ class DiffusionTrainer(object):
                 self.ema_scheduler.step()
 
         return running_loss
+
+    def _should_log_condition_diagnostics(self):
+        if not self.log_condition_diagnostics:
+            return False
+        if self.condition_diagnostics_steps > 0 and self.state.step >= self.condition_diagnostics_steps:
+            return False
+        return self.state.step % max(self.condition_diagnostics_every, 1) == 0
+
+
+    def _log_condition_diagnostics(self):
+        if not self._should_log_condition_diagnostics():
+            return
+
+        raw_model = unwrap_ddp(self.model)
+        diagnostics = {}
+        if hasattr(raw_model, "get_condition_diagnostics"):
+            last_diagnostics = raw_model.get_condition_diagnostics()
+            if last_diagnostics is not None:
+                diagnostics.update(last_diagnostics)
+        if hasattr(raw_model, "get_condition_gradient_diagnostics"):
+            diagnostics.update(raw_model.get_condition_gradient_diagnostics())
+        if not diagnostics:
+            return
+
+        reduced = {}
+        for key, value in diagnostics.items():
+            if not torch.is_tensor(value):
+                value = torch.tensor(value, device=self.device, dtype=torch.float32)
+            value = value.detach().float().reshape(1)
+            reduced[key] = self.accelerator.gather(value).mean().item()
+
+        if self.accelerator.is_main_process:
+            for key, value in reduced.items():
+                self.writer.add_scalar(f"Diag/{key}", value, global_step=self.state.step)
+            diag_str = " ".join(f"{key}={value:.6f}" for key, value in sorted(reduced.items()))
+            logger.info(f"Condition diagnostics at step {self.state.step}: {diag_str}")
 
     def _anneal_learning_rate(self, valid_loss=None):
         if self.lr_scheduler is not None:
