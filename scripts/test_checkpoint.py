@@ -1,0 +1,123 @@
+import sys
+
+# Filter out arguments injected by accelerate/torch.distributed
+# that confuse hydra
+sys.argv = [arg for arg in sys.argv if not arg.startswith("--local_rank")]
+sys.argv = [arg for arg in sys.argv if not arg.startswith("--local-rank")]
+
+import hydra
+import rootutils
+import torch
+from dotenv import load_dotenv
+from omegaconf import DictConfig, OmegaConf
+
+rootutils.setup_root(__file__, pythonpath=True)
+
+from src.data.dataset import DummyDataset
+from src.data.preprocessing import CaloShowerPreprocessor
+from src.models.calodit_3drope import FinalLayer as LegacyGatedFinalLayer
+from src.models.factory import create_model_from_config
+from src.trainer import DiffusionTrainer
+from src.utils import get_logger, import_class_by_name, setup_accelerator
+
+
+def build_model_with_legacy_final_layer(cfg: DictConfig):
+    architecture_cfg = OmegaConf.create(cfg.model.architecture)
+    method_cfg = OmegaConf.create(cfg.method)
+
+    architecture_cls = import_class_by_name(architecture_cfg["target"])
+    method_cls = import_class_by_name(method_cfg["target"])
+
+    architecture = architecture_cls(**architecture_cfg.get("init_args", {}))
+    architecture.final_layer = LegacyGatedFinalLayer(
+        channels=architecture.model_channels,
+        patch_size=architecture.patch_size,
+        out_channels=architecture.out_channels,
+        use_checkpoint=architecture.use_checkpoint,
+        use_rmsnorm=architecture.use_rmsnorm,
+    )
+    architecture.final_layer_uses_pos_emb = False
+
+    model = method_cls(model=architecture, **method_cfg.get("init_args", {}))
+    model.load_state(cfg.model.model_path)
+    model.eval()
+    return model
+
+
+@hydra.main(
+    version_base="1.3",
+    config_path="../configs",
+    config_name="experiment/CaloChallenge/flow_ccd2_pred_v_all_lightingdit_freatures",
+)
+def main(cfg: DictConfig):
+    accelerator = setup_accelerator(**cfg.accelerator)
+    logger = get_logger()
+
+    logger.info(f"Checkpoint test config before model load:\n{OmegaConf.to_yaml(cfg)}")
+
+    runtime_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    model_path = cfg.model.get("model_path")
+    if model_path:
+        saved_state = torch.load(model_path, map_location="cpu", weights_only=False)
+        saved_cfg = saved_state.get("config")
+        if saved_cfg is not None:
+            cfg = OmegaConf.create(saved_cfg)
+            cfg.model.model_path = model_path
+
+            cfg.accelerator = OmegaConf.merge(cfg.accelerator, runtime_cfg.accelerator)
+            cfg.experiment = OmegaConf.merge(cfg.experiment, runtime_cfg.experiment)
+            cfg.sampling = OmegaConf.merge(cfg.sampling, runtime_cfg.sampling)
+            cfg.train = OmegaConf.merge(cfg.train, runtime_cfg.train)
+            cfg.train.sampling_args = OmegaConf.create(
+                OmegaConf.to_container(cfg.sampling, resolve=False)
+            )
+
+    try:
+        model = create_model_from_config(cfg.model, cfg.method)
+    except RuntimeError as exc:
+        error_text = str(exc)
+        legacy_final_layer_mismatch = (
+            "final_layer.scale_shift_table" in error_text
+            and "final_layer.adaLN_modulation.1.weight" in error_text
+        )
+        if not legacy_final_layer_mismatch:
+            raise
+        logger.warning(
+            "Falling back to the legacy ClassicDiT final layer to load an older checkpoint."
+        )
+        model = build_model_with_legacy_final_layer(cfg)
+    if model.config is not None:
+        cfg = OmegaConf.merge(model.config, cfg)
+    model.save_config(cfg)
+
+    logger.info(f"Resolved checkpoint test config:\n{OmegaConf.to_yaml(cfg)}")
+
+    preprocessor = CaloShowerPreprocessor(**cfg.preprocessing)
+
+    trainer = DiffusionTrainer(
+        model=model,
+        train_dataset=DummyDataset(),
+        valid_dataset=DummyDataset(),
+        preprocessor=preprocessor,
+        accelerator=accelerator,
+        **cfg.experiment,
+        **cfg.train,
+    )
+    trainer.save_config(cfg)
+    trainer._setup_logging()
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        logger.info("Running trainer.test() from the loaded checkpoint...")
+    trainer.test()
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        logger.info("Checkpoint test completed.")
+        trainer.writer.flush()
+        trainer.writer.close()
+
+
+if __name__ == "__main__":
+    load_dotenv()
+    sys.exit(main())

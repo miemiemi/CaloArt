@@ -133,6 +133,9 @@ class DiffusionTrainer(object):
         save_best_and_last_only=False,
         load_best_model_at_end=False,
         resume_from_checkpoint=None,
+        enable_plots=True,
+        enable_fpd=False,
+        fpd_config=None,
         **kwargs,
     ):
         super().__init__()
@@ -253,6 +256,9 @@ class DiffusionTrainer(object):
         self.valid_strategy, self.valid_steps = parse_strategy(valid_strategy, valid_steps)
         self.test_strategy, self.test_steps = parse_strategy(test_strategy, test_steps)
         self.test_conditions = test_conditions
+        self.enable_plots = enable_plots
+        self.enable_fpd = enable_fpd
+        self.fpd_config = dict(fpd_config or {})
 
         self.plot_dir = self.output_dir / "plots"
         self.plot_dir.mkdir(exist_ok=True, parents=True)
@@ -474,6 +480,13 @@ class DiffusionTrainer(object):
         model.eval()
 
         logger.info("Testing...")
+        # num_showers should be a value for all sub test
+        fpd_num_showers = self.fpd_config.get("num_showers")
+        if fpd_num_showers is not None:
+            fpd_num_showers = int(fpd_num_showers)
+        metric_fpd_config = {
+            key: value for key, value in self.fpd_config.items() if key != "num_showers"
+        }
 
         for geometry, energy, phi, theta, fullsim_path in self.test_conditions:
             conditions_str = get_conditions_str(geometry, energy, phi, theta)
@@ -488,43 +501,120 @@ class DiffusionTrainer(object):
             is_ccd = False
             if geometry.startswith("CCD"):
                 is_ccd = True
-                max_num_showers = 1000
+                if self.enable_fpd and fpd_num_showers is not None:
+                    max_num_showers = fpd_num_showers
+                elif not self.enable_fpd:
+                    max_num_showers = 1000
+            elif self.enable_fpd and fpd_num_showers is not None:
+                max_num_showers = fpd_num_showers
 
             dataset = CaloShowerDataset(files=file_struc, need_geo_condn=self.need_geo_condn, train_on=self.train_on, is_ccd=is_ccd, max_num_showers=max_num_showers)
             dataloader = self._get_dataloader(dataset, self.batch_size, shuffle=False)
 
             num_samples = len(dataset)
+            num_batches = len(dataloader)
             logger.info(
                 f"Generating {num_samples} events for geometry {geometry}, energy {energy} GeV, phi {phi} and theta {theta}"
+            )
+            logger.info(
+                f"Sampling {num_samples} events in {num_batches} batches "
+                f"(per-device batch size {self.batch_size}, world size {self.accelerator.num_processes})."
             )
 
             generated_events_list = []
             orginal_events_list = []
-            for sample in tqdm(dataloader):
+            incident_energy_list = []
+            for sample in tqdm(
+                dataloader,
+                desc="Sampling",
+                disable=not self.accelerator.is_main_process,
+            ):
                 showers, conditions = sample
+                incident_energy, *_ = conditions
                 _, conditions = self.preprocessor.transform(conditions=conditions)
                 showers = cut_below_noise_level(showers, noise_level=self.preprocessor.shower_preprocessor.noise_level)
-                orginal_events_list.append(showers.squeeze(1).cpu().numpy())
-                generated_events = unwrap_ddp(model).sample(conditions=conditions, progress=self.accelerator.is_main_process, **self.sampling_args).squeeze(1)
+                generated_events = unwrap_ddp(model).sample(
+                    conditions=conditions,
+                    progress=False,
+                    **self.sampling_args,
+                ).squeeze(1)
                 generated_events, _ = self.preprocessor.inverse_transform(generated_events, conditions)
-                generated_events_list.append(generated_events.cpu().numpy())
+                gathered_original_events, gathered_generated_events, gathered_incident_energy = self.accelerator.gather_for_metrics(
+                    (
+                        showers.squeeze(1).contiguous(),
+                        generated_events.contiguous(),
+                        incident_energy.contiguous(),
+                    )
+                )
+                if self.accelerator.is_main_process:
+                    orginal_events_list.append(gathered_original_events.cpu().numpy())
+                    generated_events_list.append(gathered_generated_events.cpu().numpy())
+                    incident_energy_list.append(gathered_incident_energy.cpu().numpy().reshape(-1, 1))
 
-            original_events = np.concatenate(orginal_events_list)
-            generated_events = np.concatenate(generated_events_list)
+            original_events = None
+            generated_events = None
+            incident_energy = None
+            if self.accelerator.is_main_process:
+                original_events = np.concatenate(orginal_events_list)
+                generated_events = np.concatenate(generated_events_list)
+                incident_energy = np.concatenate(incident_energy_list)
 
             if self.accelerator.is_main_process:
-                observables = compare_observables(
-                    original_events, generated_events, output_dir, geometry, energy, phi, theta
-                )
-                for observable_name, plot_emd_dict in observables.items():
-                    self.writer.add_scalar(
-                        f"Observables/{conditions_str.replace('_', ' ')}/EMD {observable_name}",
-                        plot_emd_dict["emd"],
-                        global_step=self.state.step,
+                if self.enable_plots:           # still 1000 for keep with calodit2
+                    plot_original_events = original_events
+                    plot_generated_events = generated_events
+                    if geometry.startswith("CCD") and len(original_events) > 1000:
+                        plot_original_events = original_events[:1000]
+                        plot_generated_events = generated_events[:1000]
+                    observables = compare_observables(
+                        plot_original_events, plot_generated_events, output_dir, geometry, energy, phi, theta
                     )
+                    for observable_name, plot_emd_dict in observables.items():
+                        self.writer.add_scalar(
+                            f"Observables/{conditions_str.replace('_', ' ')}/EMD {observable_name}",
+                            plot_emd_dict["emd"],
+                            global_step=self.state.step,
+                        )
+                        if self.use_wandb:
+                            wandb.log({
+                                f"Observables/{conditions_str.replace('_', ' ')}/{observable_name}": [wandb.Image(str(plot_emd_dict["plot_path"]))]
+                            })
+
+                if self.enable_fpd:
+                    from src.evaluation.fpd_kpd import (
+                        compute_fpd_kpd,
+                        prepare_fpd_inputs,
+                    )
+
+                    gen_showers_mev, gen_energy_mev = prepare_fpd_inputs(
+                        generated_events, incident_energy, geometry=geometry
+                    )
+                    ref_showers_mev, ref_energy_mev = prepare_fpd_inputs(
+                        original_events, incident_energy, geometry=geometry
+                    )
+
+                    fpd_results = compute_fpd_kpd(
+                        generated_showers=gen_showers_mev,
+                        reference_showers=ref_showers_mev,
+                        generated_energy=gen_energy_mev,
+                        reference_energy=ref_energy_mev,
+                        geometry=geometry,
+                        output_dir=output_dir,
+                        dataset_name=conditions_str,
+                        **metric_fpd_config,
+                    )
+
+                    # Log to tensorboard
+                    for key in ["fpd_val", "fpd_err", "kpd_val", "kpd_err"]:
+                        self.writer.add_scalar(
+                            f"FPD_KPD/{conditions_str.replace('_', ' ')}/{key}",
+                            fpd_results[key],
+                            global_step=self.state.step,
+                        )
                     if self.use_wandb:
                         wandb.log({
-                            f"Observables/{conditions_str.replace('_', ' ')}/{observable_name}": [wandb.Image(str(plot_emd_dict["plot_path"]))]
+                            f"FPD_KPD/{conditions_str}/{k}": v
+                            for k, v in fpd_results.items()
                         })
 
             self.accelerator.wait_for_everyone()

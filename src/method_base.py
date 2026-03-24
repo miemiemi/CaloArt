@@ -41,3 +41,6 @@ class MethodBase(nn.Module):
 
     def summarize(self):
         summary(self.model, input_data=self.model.example_input, col_names=["input_size", "output_size", "num_params"])
+        logger.warning(
+            "torchinfo `Total mult-adds` is not reliable for this model; use the DeepSpeed/ptflops GPU profiling flow for trusted FLOPs/MACs."
+        )

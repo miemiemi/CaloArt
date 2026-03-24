@@ -17,7 +17,8 @@ from src.models.layers_3drope import (
     SwiGLUFFN,
     VolumeEmbedder,
     VolumeUnembedder,
-    PixArtFinalLayer
+    PixArtFinalLayer,
+    ClassicDiTFinalLayer
 )
 
 class TimestepEmbedder(nn.Module):
@@ -270,6 +271,94 @@ class CaloLightningDiTBlock(nn.Module):
         else:
             return self._forward(x, mod, phases)
 
+class CaloDit2FinalLayer(nn.Module):
+    """
+    Final head that mixes global conditioning with absolute positional
+    embeddings to produce per-token shift, scale, and gate parameters.
+    """
+    def __init__(
+        self,
+        channels: int,
+        patch_size: Tuple[int, int, int], 
+        out_channels: int,
+        use_checkpoint: bool = False,
+        use_rmsnorm: bool = False,
+    ):
+        super().__init__()
+        self.use_checkpoint = use_checkpoint
+        self.use_rmsnorm = use_rmsnorm
+        if not use_rmsnorm:
+            self.norm_final = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
+        else:
+            self.norm_final = RMSNorm32(channels, eps=1e-6)
+            
+        if isinstance(patch_size, int):
+            patch_vol = patch_size # may cause bug here shit code
+        else:
+            patch_vol = math.prod(patch_size)
+
+        self.linear = nn.Linear(channels, patch_vol * out_channels, bias=True)
+
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(channels, 3 * channels, bias=True)
+        )
+
+        self.adaLN_modulation_pos = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(channels, 3 * channels, bias=True),
+        )
+
+
+    def _forward(self, x: torch.Tensor, mod: torch.Tensor, pos_emb: torch.Tensor) -> torch.Tensor:
+        # mod: (B, C) - condition/time embedding
+        # pos_emb: (1 or B, seq_len, C) - position embedding
+        # x: (B, seq_len, C)
+
+        B, seq_len, C = x.shape
+        if pos_emb is None:
+            raise ValueError("CaloDit2FinalLayer requires absolute positional embeddings, got None.")
+        if pos_emb.ndim != 3:
+            raise ValueError(f"Expected pos_emb to have shape (1 or B, seq_len, C), got {tuple(pos_emb.shape)}.")
+        if pos_emb.shape[0] not in (1, B):
+            raise ValueError(
+                f"Expected pos_emb batch dimension to be 1 or {B}, got {pos_emb.shape[0]}."
+            )
+        if pos_emb.shape[1] != seq_len or pos_emb.shape[2] != C:
+            raise ValueError(
+                "Expected pos_emb to match token shape "
+                f"(*, {seq_len}, {C}), got {tuple(pos_emb.shape)}."
+            )
+
+        # condition modulation: (B, 3C) -> 3 x (B, C)
+        c_ada = self.adaLN_modulation(mod).chunk(3, dim=-1)
+        # position modulation: (1 or B, seq_len, 3C) -> 3 x (1 or B, seq_len, C)
+        pos_ada = self.adaLN_modulation_pos(pos_emb).chunk(3, dim=-1)
+
+        # combine condition (broadcast to seq_len) and position (broadcast to batch)
+        # result: 3 x (B, seq_len, C)
+        shift, scale, gate = [
+            c.unsqueeze(1).expand(-1, seq_len, -1) + p.expand(B, -1, -1)
+            for c, p in zip(c_ada, pos_ada)
+        ]
+
+        gate = torch.sigmoid(gate)
+        h = self.norm_final(x)
+
+        # per-token modulation: (B, seq_len, C)
+        h = h * (1 + scale) + shift
+
+        # Gating with per-token gate
+        x = (1 - gate) * x + gate * h
+        x = self.linear(x)
+        return x
+
+    @torch.compile
+    def forward(self, x: torch.Tensor, mod: torch.Tensor, pos_emb: torch.Tensor) -> torch.Tensor:
+        if self.use_checkpoint:
+            return torch.utils.checkpoint.checkpoint(self._forward, x, mod, pos_emb, use_reentrant=False)
+        return self._forward(x, mod, pos_emb)
+    
 class FinalLayer(nn.Module):
     """
     Final token-to-patch prediction head for CaloLightningDiT.
@@ -350,6 +439,15 @@ class CaloLightningDiT(nn.Module):
         - `rope`: rotary positional encoding computed from the same 3D patch
           grid used by patch embedding.
 
+    Final layer selection:
+        - `auto`: use `CaloDit2FinalLayer` when APE is enabled, otherwise use
+          `PixArtFinalLayer` when `share_mod=True`, and fall back to the gated
+          local `FinalLayer` when `share_mod=False`.
+        - `calodit2`: always use `CaloDit2FinalLayer` and require APE.
+        - `pixart`: always use `PixArtFinalLayer` and require `share_mod=True`.
+        - `classicdit`: use the vanilla DiT final head.
+        - `gated` / `final`: use the local gated `FinalLayer`.
+
     The patch grid size is:
         `(R / pR, PHI / pPHI, Z / pZ)`
     where `patch_size = (pR, pPHI, pZ)`.
@@ -378,7 +476,7 @@ class CaloLightningDiT(nn.Module):
         use_rmsnorm: bool = False,
         use_conv: bool = False,
         condition_embed_dims: Optional[Sequence[int]] = None,
-        condition_embed_init: Literal["auto", "legacy_timestep_like"] = "auto",
+        final_layer_type: Literal["auto", "calodit2", "pixart", "classicdit", "gated", "final"] = "auto",
         **kwargs
     ):
         super().__init__()
@@ -401,7 +499,7 @@ class CaloLightningDiT(nn.Module):
         self.proj_drop = proj_drop
         self.use_rmsnorm = use_rmsnorm
         self.dtype = str_to_dtype(dtype) if isinstance(dtype, str) else dtype
-        self.condition_embed_init = condition_embed_init
+        self.final_layer_type = final_layer_type
 
         # 2. 核心修改：先初始化 Patch Embedder
         # 我们直接使用 VolumeEmbedder 来处理 grid_size 的计算逻辑
@@ -512,14 +610,83 @@ class CaloLightningDiT(nn.Module):
         ])
 
         # 6. 输出层与 Unpatchify
-        # 修正：FinalLayer 的输出必须匹配 Unpatchify 的输入要求 (Patch体积 * C_out)
-        self.final_layer = PixArtFinalLayer(
-            hidden_size=model_channels,
-            patch_size=self.patch_size,
-            out_channels=out_channels,
-            use_checkpoint=self.use_checkpoint,
-            use_rmsnorm=self.use_rmsnorm,
-        )
+        # FinalLayer 的输出必须匹配 Unpatchify 的输入要求 (Patch体积 * C_out)。
+        # 是否使用 CaloDit2FinalLayer 与是否启用 APE 解耦；只有在真正选择
+        # CaloDit2FinalLayer 时，才要求提供 absolute positional embeddings。
+        final_layer_aliases = {
+            "auto": "auto",
+            "calodit2": "calodit2",
+            "pixart": "pixart",
+            "classicdit": "classicdit",
+            "gated": "gated",
+            "final": "gated",
+        }
+        try:
+            normalized_final_layer_type = final_layer_aliases[self.final_layer_type]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unsupported final_layer_type={self.final_layer_type!r}. "
+                "Expected one of: 'auto', 'calodit2', 'pixart', 'classicdit', 'gated', 'final'."
+            ) from exc
+
+        if normalized_final_layer_type == "auto":
+            if self._use_ape:
+                resolved_final_layer_type = "calodit2"
+            elif self.share_mod:
+                resolved_final_layer_type = "pixart"
+            else:
+                resolved_final_layer_type = "gated"
+        else:
+            resolved_final_layer_type = normalized_final_layer_type
+
+        if resolved_final_layer_type == "calodit2" and not self._use_ape:
+            raise ValueError(
+                "CaloDit2FinalLayer requires pe_mode to include 'ape' so absolute "
+                "positional embeddings are available."
+            )
+
+        if resolved_final_layer_type == "pixart" and not self.share_mod:
+            raise ValueError(
+                "PixArtFinalLayer requires share_mod=True."
+            )
+
+        self.final_layer_type = resolved_final_layer_type
+        if self.final_layer_type == "calodit2":
+            self.final_layer = CaloDit2FinalLayer(
+                channels=model_channels,
+                patch_size=self.patch_size,
+                out_channels=out_channels,
+                use_checkpoint=self.use_checkpoint,
+                use_rmsnorm=self.use_rmsnorm,
+            )
+            self.final_layer_uses_pos_emb = True
+        elif self.final_layer_type == "pixart":
+            self.final_layer = PixArtFinalLayer(
+                channels=model_channels,
+                patch_size=self.patch_size,
+                out_channels=out_channels,
+                use_checkpoint=self.use_checkpoint,
+                use_rmsnorm=self.use_rmsnorm,
+            )
+            self.final_layer_uses_pos_emb = False
+        elif self.final_layer_type == "classicdit":
+            self.final_layer = ClassicDiTFinalLayer(
+                channels=model_channels,
+                patch_size=self.patch_size,
+                out_channels=out_channels,
+                use_checkpoint=self.use_checkpoint,
+                use_rmsnorm=self.use_rmsnorm,
+            )
+            self.final_layer_uses_pos_emb = False
+        else:
+            self.final_layer = FinalLayer(
+                channels=model_channels,
+                patch_size=self.patch_size,
+                out_channels=out_channels,
+                use_checkpoint=self.use_checkpoint,
+                use_rmsnorm=self.use_rmsnorm,
+            )
+            self.final_layer_uses_pos_emb = False
         
         self.unpatchify = VolumeUnembedder(
             output_size=self.input_size, # 还原回原始尺寸
@@ -567,11 +734,6 @@ class CaloLightningDiT(nn.Module):
             def _init_condition_embedder(embedder: Optional[nn.Module]) -> None:
                 if embedder is None:
                     return
-                if (
-                    isinstance(embedder, MLPConditionEmbedder)
-                    and self.condition_embed_init == "auto"
-                ):
-                    return
                 for module in embedder.mlp:
                     if isinstance(module, nn.Linear):
                         nn.init.normal_(module.weight, std=0.02)
@@ -593,6 +755,13 @@ class CaloLightningDiT(nn.Module):
                 for block in self.blocks:
                     nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
                     nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+            if hasattr(self.final_layer, "adaLN_modulation"):
+                nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+            if hasattr(self.final_layer, "adaLN_modulation_pos"):
+                nn.init.constant_(self.final_layer.adaLN_modulation_pos[-1].weight, 0)
+                nn.init.constant_(self.final_layer.adaLN_modulation_pos[-1].bias, 0)
 
             # C. Final Layer (关键：Zero-Init)
             # 1. Zero-out 线性投影层，使得初始输出为 0 (类似高斯噪声的均值)
@@ -724,7 +893,10 @@ class CaloLightningDiT(nn.Module):
             # 7. Final Layer
             # 关键点：这里传入原始的 c_global (维度 D)
             # 因为 FinalLayer 定义了自己的映射层 (adaLN_modulation_condn)，它期望输入维度为 model_channels
-            x = self.final_layer(x, c_global)    
+            if self.final_layer_uses_pos_emb:
+                x = self.final_layer(x, c_global, self.pos_emb)
+            else:
+                x = self.final_layer(x, c_global)
 
             # 8. Unpatchify (Tokens -> Image)
             x = self.unpatchify(x)

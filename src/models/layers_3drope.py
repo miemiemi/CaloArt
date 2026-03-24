@@ -218,7 +218,7 @@ class PixArtFinalLayer(nn.Module):
 
     def __init__(
         self,
-        hidden_size: int,
+        channels: int,
         patch_size,
         out_channels: int,
         use_checkpoint: bool = False,
@@ -229,17 +229,17 @@ class PixArtFinalLayer(nn.Module):
         self.use_rmsnorm = use_rmsnorm
 
         if not use_rmsnorm:
-            self.norm_final = LayerNorm32(hidden_size, elementwise_affine=False, eps=1e-6)
+            self.norm_final = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
         else:
-            self.norm_final = RMSNorm32(hidden_size, eps=1e-6)
+            self.norm_final = RMSNorm32(channels, eps=1e-6)
 
         if isinstance(patch_size, int):
             patch_vol = patch_size
         else:
             patch_vol = math.prod(patch_size)
 
-        self.linear = nn.Linear(hidden_size, patch_vol * out_channels, bias=True)
-        self.scale_shift_table = nn.Parameter(torch.randn(2, hidden_size) / hidden_size ** 0.5)
+        self.linear = nn.Linear(channels, patch_vol * out_channels, bias=True)
+        self.scale_shift_table = nn.Parameter(torch.randn(2, channels) / channels ** 0.5)
         self.out_channels = out_channels
 
     def _forward(self, x: torch.Tensor, mod: torch.Tensor) -> torch.Tensor:
@@ -254,3 +254,52 @@ class PixArtFinalLayer(nn.Module):
             return torch.utils.checkpoint.checkpoint(self._forward, x, mod, use_reentrant=False)
         return self._forward(x, mod)
     
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+class ClassicDiTFinalLayer(nn.Module):
+    """
+    The final layer of DiT.
+    """
+    def __init__(
+        self,
+        channels: int,
+        patch_size,
+        out_channels: int,
+        use_checkpoint: bool = False,
+        use_rmsnorm: bool = False,
+    ):
+        super().__init__()
+        self.use_checkpoint = use_checkpoint
+        self.use_rmsnorm = use_rmsnorm
+        if not use_rmsnorm:
+            self.norm_final = LayerNorm32(channels, elementwise_affine=False, eps=1e-6)
+        else:
+            self.norm_final = RMSNorm32(channels, eps=1e-6)
+            
+        if isinstance(patch_size, int):
+            patch_vol = patch_size # may cause bug here shit code
+        else:
+            patch_vol = math.prod(patch_size)
+
+        self.linear = nn.Linear(channels, patch_vol * out_channels, bias=True)
+
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(channels, 2 * channels, bias=True)
+        )
+
+    def _forward(self, x: torch.Tensor, mod: torch.Tensor) -> torch.Tensor:
+        # mod: (B, C)
+        # linear projection -> (B, 3C)
+        shift, scale = self.adaLN_modulation(mod).chunk(2, dim=1)
+        x = modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x
+
+    @torch.compile
+    def forward(self, x: torch.Tensor, mod: torch.Tensor) -> torch.Tensor:
+        if self.use_checkpoint:
+            return torch.utils.checkpoint.checkpoint(self._forward, x, mod, use_reentrant=False)
+        return self._forward(x, mod)
+
