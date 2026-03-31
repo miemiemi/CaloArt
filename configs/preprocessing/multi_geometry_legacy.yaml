@@ -1,0 +1,13 @@
+# Legacy preprocessing pipeline from the exported EDM checkpoint config.
+steps:
+  - class_name: src.data.preprocessing.CutNoise
+    init_args:
+      noise_level: 1.515e-05
+      both_directions: false
+  - class_name: src.data.preprocessing.LogTransform
+    init_args:
+      eps: 1.0e-06
+  - class_name: src.data.preprocessing.Standarize
+    init_args:
+      mean: -10.766
+      std: 3.5773

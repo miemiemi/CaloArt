@@ -1,18 +1,15 @@
 # @package _global_
 
-# CaloChallenge CCD2: latest-code-compatible variant of the PixArt final-layer
-# APE+RoPE + Heun-32 experiment.
-#
-# This keeps the same experiment intent as
-# `flow_ccd2_pred_v_all_lightingdit_freatures_c72_36_36_pixart_sharemod_heun32`
-# while making the final-layer choice explicit for the current model code.
+# CaloChallenge CCD2: EDM training with the original CaloDiT model.
+# This mirrors the current EDM CCD2 training recipe used for the latest
+# CaloArt paper runs, while swapping the backbone to src.models.CaloDiT.
 
 defaults:
   - /data: ccd2
   - /preprocessing@preprocessing: ccd2
-  - /model@model.architecture: calolightning_ape_rope_sharemod_conv_c72_36_36_pixart_rmsnorm
-  - /method: flow_matching/logit_normal
-  - /sampling: flow/heun_32
+  - /model@model.architecture: calodit
+  - /method: edm
+  - /sampling: edm/heun_32_legacy
   - _self_
 
 hydra:
@@ -24,7 +21,7 @@ hydra:
 
 experiment:
   project_name: CaloArt_paper
-  run_name: flow_ccd2_pred_v_all_lightingdit_freatures_c72_36_36_ape_rope_sharemod_heun32_fpd_latest
+  run_name: edm_ccd2_pred_v_all_calodit_h144_heun32_fpd_latest
   output_dir: ./experiments
   seed: 42
   use_wandb: true
@@ -59,9 +56,9 @@ train:
     weight_decay: 1.0e-05
   lr_scheduler_class: src.lr_schedulers.get_lr_scheduler
   lr_scheduler_args:
-    lr_scheduler_type: cosine
-    num_training_steps: 400000
-    num_warmup_steps: 10000
+    lr_scheduler_type: wsd
+    num_max_steps: 400000
+    decay_type: sqrt
   ema_scheduler_class: src.models.ema.InverseDecayEMA
   ema_scheduler_args:
     power: 0.7
@@ -84,8 +81,6 @@ train:
   fpd_config:
     num_showers: 100000
     save_generated: true
-    # Match CCD2 preprocessing noise_level=0.5e-6 GeV in evaluator space:
-    # 0.5e-6 * 1000 / 0.033
     cut: 0.015151515151515152
   need_geo_condn: false
   train_on: null

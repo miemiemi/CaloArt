@@ -1,11 +1,7 @@
 # @package _global_
 
-# CaloChallenge CCD2: latest-code-compatible variant of the PixArt final-layer
+# CaloChallenge CCD2: hidden=256, layers=6 variant of the PixArt final-layer
 # APE+RoPE + Heun-32 experiment.
-#
-# This keeps the same experiment intent as
-# `flow_ccd2_pred_v_all_lightingdit_freatures_c72_36_36_pixart_sharemod_heun32`
-# while making the final-layer choice explicit for the current model code.
 
 defaults:
   - /data: ccd2
@@ -24,7 +20,7 @@ hydra:
 
 experiment:
   project_name: CaloArt_paper
-  run_name: flow_ccd2_pred_v_all_lightingdit_freatures_c72_36_36_ape_rope_sharemod_heun32_fpd_latest
+  run_name: flow_ccd2_pred_v_all_lightingdit_freatures_h256_l6_ape_rope_sharemod_heun32_fpd_latest
   output_dir: ./experiments
   seed: 42
   use_wandb: true
@@ -35,6 +31,11 @@ accelerator:
 
 model:
   model_path: null
+  architecture:
+    init_args:
+      condition_embed_dims: [128, 64, 64]
+      model_channels: 256
+      num_blocks: 6
 
 data:
   train:
@@ -84,8 +85,6 @@ train:
   fpd_config:
     num_showers: 100000
     save_generated: true
-    # Match CCD2 preprocessing noise_level=0.5e-6 GeV in evaluator space:
-    # 0.5e-6 * 1000 / 0.033
     cut: 0.015151515151515152
   need_geo_condn: false
   train_on: null

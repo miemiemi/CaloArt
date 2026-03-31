@@ -274,9 +274,7 @@ class Attention(nn.Module):
         b, n, d = x.shape
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.num_heads, d=self.head_dim), qkv)
-        attention_scores = einsum(q, k, "b h i d, b h j d -> b h i j") * self.scale
-        attention_probs = attention_scores.softmax(dim=-1)
-        outputs = einsum(attention_probs, v, "b h i j, b h j d -> b h i d")
+        outputs = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
         outputs = rearrange(outputs, "b h n d -> b n (h d)")
         outputs = self.to_out(outputs)
 

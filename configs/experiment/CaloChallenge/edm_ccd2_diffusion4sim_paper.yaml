@@ -1,0 +1,98 @@
+# @package _global_
+
+# CaloChallenge CCD2: EDM recipe aligned to
+# diffusion4sim/configs/train/ccd2.yaml while using the paper-era
+# CaloDiT backbone implementation in src/models/calodit_paper.py.
+
+defaults:
+  - /data: ccd2
+  - /preprocessing@preprocessing: ccd2_diffusion4sim
+  - /model@model.architecture: calodit_paper_h384_l6_nh6
+  - /method: edm
+  - /sampling: edm/heun_32_legacy
+  - _self_
+
+hydra:
+  job:
+    chdir: False
+  run:
+    dir: .
+  output_subdir: null
+
+experiment:
+  project_name: ccd2_calodit_cont
+  run_name: edm
+  output_dir: ${oc.env:RESULTS_DIR,./results}/experiments
+  seed: 42
+  use_wandb: true
+
+accelerator:
+  cpu: false
+  mixed_precision: "no"
+
+model:
+  model_path: null
+
+data:
+  train:
+    files:
+      - /aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets/dataset_2_1.hdf5
+    use_cond_info: true
+    is_ccd: true
+    need_geo_condn: false
+    train_on: null
+  valid:
+    files:
+      - /aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets/dataset_2_2.hdf5
+    use_cond_info: true
+    is_ccd: true
+    need_geo_condn: false
+    train_on: null
+
+train:
+  learning_rate: 0.001
+  per_device_batch_size: 128
+  num_workers: 0
+  valid_num_workers: 0
+  max_steps: 100000
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_class: torch.optim.AdamW
+  optimizer_args:
+    betas: [0.9, 0.99]
+    eps: 1.0e-08
+    weight_decay: 0.0001
+  lr_scheduler_class: src.lr_schedulers.get_lr_scheduler
+  lr_scheduler_args:
+    lr_scheduler_type: wsd
+    num_warmup_steps: 5000
+    num_stable_steps: 80000
+    num_decay_steps: 15000
+    decay_type: sqrt
+  ema_scheduler_class: src.models.ema.InverseDecayEMA
+  ema_scheduler_args:
+    power: 0.75
+    max_value: 0.9999
+  sampling_args: ${sampling}
+  valid_strategy: steps
+  valid_steps: 1000
+  logging_strategy: steps
+  logging_steps: 100
+  save_strategy: steps
+  save_steps: 10000
+  save_best_and_last_only: false
+  load_best_model_at_end: false
+  test_strategy: steps
+  test_steps: 10000
+  test_conditions:
+    - ['CCD2', -1, 0.0, 1.57, '/aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets/dataset_2_2.hdf5']
+  enable_plots: true
+  enable_fpd: true
+  fpd_config:
+    num_showers: 100000
+    save_generated: true
+    # Match the default vit4hep CCD2 evaluation config (`eval_cut: 0.015`).
+    cut: 0.015
+  need_geo_condn: false
+  train_on: null
+  

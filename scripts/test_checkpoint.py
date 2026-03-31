@@ -9,6 +9,7 @@ import hydra
 import rootutils
 import torch
 from dotenv import load_dotenv
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 rootutils.setup_root(__file__, pythonpath=True)
@@ -44,10 +45,26 @@ def build_model_with_legacy_final_layer(cfg: DictConfig):
     return model
 
 
+def _runtime_overrides_to_cfg():
+    override_entries = []
+    for entry in HydraConfig.get().overrides.task:
+        if entry.startswith(("~", "hydra.")):
+            continue
+        if "=" not in entry:
+            continue
+        key, value = entry.split("=", 1)
+        key = key.lstrip("+")
+        if key == "model.model_path":
+            continue
+        override_entries.append(f"{key}={value}")
+
+    return OmegaConf.from_dotlist(override_entries)
+
+
 @hydra.main(
     version_base="1.3",
     config_path="../configs",
-    config_name="experiment/CaloChallenge/flow_ccd2_pred_v_all_lightingdit_freatures",
+    config_name="experiment/CaloChallenge/edm",
 )
 def main(cfg: DictConfig):
     accelerator = setup_accelerator(**cfg.accelerator)
@@ -55,19 +72,14 @@ def main(cfg: DictConfig):
 
     logger.info(f"Checkpoint test config before model load:\n{OmegaConf.to_yaml(cfg)}")
 
-    runtime_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    runtime_overrides = _runtime_overrides_to_cfg()
     model_path = cfg.model.get("model_path")
     if model_path:
         saved_state = torch.load(model_path, map_location="cpu", weights_only=False)
         saved_cfg = saved_state.get("config")
         if saved_cfg is not None:
-            cfg = OmegaConf.create(saved_cfg)
+            cfg = OmegaConf.merge(OmegaConf.create(saved_cfg), runtime_overrides)
             cfg.model.model_path = model_path
-
-            cfg.accelerator = OmegaConf.merge(cfg.accelerator, runtime_cfg.accelerator)
-            cfg.experiment = OmegaConf.merge(cfg.experiment, runtime_cfg.experiment)
-            cfg.sampling = OmegaConf.merge(cfg.sampling, runtime_cfg.sampling)
-            cfg.train = OmegaConf.merge(cfg.train, runtime_cfg.train)
             cfg.train.sampling_args = OmegaConf.create(
                 OmegaConf.to_container(cfg.sampling, resolve=False)
             )

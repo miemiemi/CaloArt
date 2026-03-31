@@ -1,0 +1,59 @@
+# Legacy multi-geometry dataset paths, remapped to the local LEMURS zenodo mirror.
+# We keep the existing 4-geometry label space expected by the current model:
+# Par04 -> LEMURS_Par04SiW
+# SciPb -> LEMURS_Par04SciPb
+# ODD   -> LEMURS_ODD
+# CLD   -> LEMURS_FCCeeCLD
+# LEMURS_FCCeeALLEGRO is intentionally not included here because that would
+# require expanding the geometry condition dimension in the model config.
+train:
+  files:
+    - ["Par04", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SiW_gamma_100kEvents_1GeV1TeV_GPSflat_part1.h5"]
+    - ["Par04", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SiW_gamma_100kEvents_1GeV1TeV_GPSflat_part2.h5"]
+    - ["Par04", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SiW_gamma_100kEvents_1GeV1TeV_GPSflat_part3.h5"]
+    - ["Par04", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SiW_gamma_100kEvents_1GeV1TeV_GPSflat_part4.h5"]
+    - ["Par04", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SiW_gamma_100kEvents_1GeV1TeV_GPSflat_part5.h5"]
+    - ["Par04", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SiW_gamma_100kEvents_1GeV1TeV_GPSflat_part6.h5"]
+    - ["Par04", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SiW_gamma_100kEvents_1GeV1TeV_GPSflat_part7.h5"]
+    - ["Par04", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SiW_gamma_100kEvents_1GeV1TeV_GPSflat_part8.h5"]
+    - ["Par04", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SiW_gamma_100kEvents_1GeV1TeV_GPSflat_part9.h5"]
+    - ["SciPb", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SciPb_gamma_100kEvents_1GeV1TeV_GPSflat_part1.h5"]
+    - ["SciPb", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SciPb_gamma_100kEvents_1GeV1TeV_GPSflat_part2.h5"]
+    - ["SciPb", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SciPb_gamma_100kEvents_1GeV1TeV_GPSflat_part3.h5"]
+    - ["SciPb", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SciPb_gamma_100kEvents_1GeV1TeV_GPSflat_part4.h5"]
+    - ["SciPb", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SciPb_gamma_100kEvents_1GeV1TeV_GPSflat_part5.h5"]
+    - ["SciPb", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SciPb_gamma_100kEvents_1GeV1TeV_GPSflat_part6.h5"]
+    - ["SciPb", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SciPb_gamma_100kEvents_1GeV1TeV_GPSflat_part7.h5"]
+    - ["SciPb", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SciPb_gamma_100kEvents_1GeV1TeV_GPSflat_part8.h5"]
+    - ["SciPb", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SciPb_gamma_100kEvents_1GeV1TeV_GPSflat_part9.h5"]
+    - ["ODD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_ODD_gamma_100kEvents_1GeV1TeV_GPSflat_part1.h5"]
+    - ["ODD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_ODD_gamma_100kEvents_1GeV1TeV_GPSflat_part2.h5"]
+    - ["ODD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_ODD_gamma_100kEvents_1GeV1TeV_GPSflat_part3.h5"]
+    - ["ODD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_ODD_gamma_100kEvents_1GeV1TeV_GPSflat_part4.h5"]
+    - ["ODD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_ODD_gamma_100kEvents_1GeV1TeV_GPSflat_part5.h5"]
+    - ["ODD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_ODD_gamma_100kEvents_1GeV1TeV_GPSflat_part6.h5"]
+    - ["ODD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_ODD_gamma_100kEvents_1GeV1TeV_GPSflat_part7.h5"]
+    - ["ODD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_ODD_gamma_100kEvents_1GeV1TeV_GPSflat_part8.h5"]
+    - ["ODD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_ODD_gamma_100kEvents_1GeV1TeV_GPSflat_part9.h5"]
+    - ["CLD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_FCCeeCLD_gamma_100kEvents_1GeV100GeV_GPSflat_part1.h5"]
+    - ["CLD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_FCCeeCLD_gamma_100kEvents_1GeV100GeV_GPSflat_part2.h5"]
+    - ["CLD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_FCCeeCLD_gamma_100kEvents_1GeV100GeV_GPSflat_part3.h5"]
+    - ["CLD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_FCCeeCLD_gamma_100kEvents_1GeV100GeV_GPSflat_part4.h5"]
+    - ["CLD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_FCCeeCLD_gamma_100kEvents_1GeV100GeV_GPSflat_part5.h5"]
+    - ["CLD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_FCCeeCLD_gamma_100kEvents_1GeV100GeV_GPSflat_part6.h5"]
+    - ["CLD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_FCCeeCLD_gamma_100kEvents_1GeV100GeV_GPSflat_part7.h5"]
+    - ["CLD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_FCCeeCLD_gamma_100kEvents_1GeV100GeV_GPSflat_part8.h5"]
+    - ["CLD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_FCCeeCLD_gamma_100kEvents_1GeV100GeV_GPSflat_part9.h5"]
+  use_cond_info: true
+  need_geo_condn: true
+  train_on: ["Par04", "SciPb", "ODD", "CLD"]
+
+valid:
+  files:
+    - ["Par04", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SiW_gamma_100kEvents_1GeV1TeV_GPSflat_part10.h5"]
+    - ["SciPb", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_Par04SciPb_gamma_100kEvents_1GeV1TeV_GPSflat_part10.h5"]
+    - ["ODD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_ODD_gamma_100kEvents_1GeV1TeV_GPSflat_part10.h5"]
+    - ["CLD", "/aifs/user/data/huangzhengkun/datasets/hepdatasets/LEMURS/zenodo_17045562/LEMURS_FCCeeCLD_gamma_100kEvents_1GeV100GeV_GPSflat_part10.h5"]
+  use_cond_info: true
+  need_geo_condn: true
+  train_on: ["Par04", "SciPb", "ODD", "CLD"]

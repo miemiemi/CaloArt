@@ -1,0 +1,10 @@
+step: 199960
+geometry: CCD2
+energy: -1
+phi: 0.0
+theta: 1.57
+model_path: /aifs/user/home/huangzhengkun/work/repositories/CaloFlow/.codex/tmp/codex_smoke/ema_model_with_config_ckpt_smoke/plots/199960/ema_model_with_config.pt
+fpd_val: 138.85431936672646
+fpd_err: 4.218270718588904
+kpd_val: 1.7619369518646688
+kpd_err: 3.008848678792157

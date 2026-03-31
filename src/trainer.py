@@ -21,6 +21,7 @@ from tqdm.auto import tqdm
 
 from src.data.dataset import CaloShowerDataset
 from src.data.preprocessing import CaloShowerPreprocessor, cut_below_noise_level
+from src.data.utils import save_showers
 from src.evaluation.utils import compare_observables
 from src.method_base import MethodBase
 from src.models.ema import ema_update
@@ -480,12 +481,23 @@ class DiffusionTrainer(object):
         model.eval()
 
         logger.info("Testing...")
+        step_output_dir = self.plot_dir / f"{self.state.step}"
+        model_artifact_path = None
+        if self.enable_fpd and self.accelerator.is_main_process:
+            step_output_dir.mkdir(parents=True, exist_ok=True)
+            model_filename = "ema_model_with_config.pt" if self.use_ema else "model_with_config.pt"
+            model_artifact_path = step_output_dir / model_filename
+            self.accelerator.unwrap_model(model).save_state(model_artifact_path)
+
         # num_showers should be a value for all sub test
         fpd_num_showers = self.fpd_config.get("num_showers")
         if fpd_num_showers is not None:
             fpd_num_showers = int(fpd_num_showers)
+        save_generated_for_fpd = bool(self.fpd_config.get("save_generated", False))
         metric_fpd_config = {
-            key: value for key, value in self.fpd_config.items() if key != "num_showers"
+            key: value
+            for key, value in self.fpd_config.items()
+            if key not in {"num_showers", "save_generated"}
         }
 
         for geometry, energy, phi, theta, fullsim_path in self.test_conditions:
@@ -497,16 +509,13 @@ class DiffusionTrainer(object):
             else:
                 file_struc = [fullsim_path,]
 
-            max_num_showers = None
-            is_ccd = False
-            if geometry.startswith("CCD"):
-                is_ccd = True
-                if self.enable_fpd and fpd_num_showers is not None:
-                    max_num_showers = fpd_num_showers
-                elif not self.enable_fpd:
-                    max_num_showers = 1000
-            elif self.enable_fpd and fpd_num_showers is not None:
+            is_ccd = geometry.startswith("CCD")
+            if self.enable_fpd and fpd_num_showers is not None:
                 max_num_showers = fpd_num_showers
+            elif is_ccd:
+                max_num_showers = 1000
+            else:
+                max_num_showers = None
 
             dataset = CaloShowerDataset(files=file_struc, need_geo_condn=self.need_geo_condn, train_on=self.train_on, is_ccd=is_ccd, max_num_showers=max_num_showers)
             dataloader = self._get_dataloader(dataset, self.batch_size, shuffle=False)
@@ -563,7 +572,7 @@ class DiffusionTrainer(object):
                 if self.enable_plots:           # still 1000 for keep with calodit2
                     plot_original_events = original_events
                     plot_generated_events = generated_events
-                    if geometry.startswith("CCD") and len(original_events) > 1000:
+                    if is_ccd and len(original_events) > 1000:
                         plot_original_events = original_events[:1000]
                         plot_generated_events = generated_events[:1000]
                     observables = compare_observables(
@@ -585,6 +594,25 @@ class DiffusionTrainer(object):
                         compute_fpd_kpd,
                         prepare_fpd_inputs,
                     )
+
+                    if save_generated_for_fpd:
+                        output_dir.mkdir(parents=True, exist_ok=True)
+                        generated_output_path = output_dir / "generated.h5"
+                        if generated_output_path.exists():
+                            logger.warning(
+                                "File %s already exists, overwriting",
+                                generated_output_path,
+                            )
+                            generated_output_path.unlink()
+                        save_showers(
+                            generated_events,
+                            incident_energy,
+                            phi,
+                            theta,
+                            generated_output_path,
+                            is_ccd=is_ccd,
+                        )
+                        logger.info("Saved generated events to %s", generated_output_path)
 
                     gen_showers_mev, gen_energy_mev = prepare_fpd_inputs(
                         generated_events, incident_energy, geometry=geometry
@@ -616,6 +644,20 @@ class DiffusionTrainer(object):
                             f"FPD_KPD/{conditions_str}/{k}": v
                             for k, v in fpd_results.items()
                         })
+
+                    score_payload = {
+                        "step": self.state.step,
+                        "geometry": geometry,
+                        "energy": energy,
+                        "phi": phi,
+                        "theta": theta,
+                        "model_path": str(model_artifact_path) if model_artifact_path is not None else None,
+                        **{
+                            key: value.item() if isinstance(value, np.generic) else value
+                            for key, value in fpd_results.items()
+                        },
+                    }
+                    OmegaConf.save(score_payload, output_dir / "fpd_kpd.yaml")
 
             self.accelerator.wait_for_everyone()
 

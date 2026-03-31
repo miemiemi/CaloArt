@@ -226,21 +226,16 @@ def compute_fpd_kpd(
         reference_showers, reference_energy, hlf_ref, 1.0, cut=cut
     )[:, :-1]
 
-    # Compute FPD and KPD
+    # Compute FPD and KPD with the same defaults used by the original
+    # vit4hep `experiments.calo_utils.ugr_evaluation.evaluate.py` path after
+    # the caller has converted showers into evaluator space.
     logger.info("Computing FPD...")
-    effective_min_samples = min(min_samples, len(reference_array), len(source_array))
-    if effective_min_samples < min_samples:
-        logger.warning(
-            "Reducing FPD min_samples from %s to %s to match available events.",
-            min_samples,
-            effective_min_samples,
-        )
     fpd_val, fpd_err = jetnet.evaluation.fpd(
-        reference_array, source_array, min_samples=effective_min_samples
+        reference_array, source_array, min_samples=min_samples
     )
     logger.info("Computing KPD...")
     kpd_val, kpd_err = jetnet.evaluation.kpd(
-        reference_array, source_array, batch_size=min(batch_size, len(source_array))
+        reference_array, source_array, batch_size=batch_size
     )
 
     result_str = (
