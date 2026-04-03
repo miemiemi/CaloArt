@@ -74,6 +74,7 @@ def prepare_high_data_for_classifier(voxel_orig, E_inc_orig, hlf_class, label, c
     Ported from ugr_evaluation/evaluate.py.
     """
     E_inc = E_inc_orig.copy()
+    E_tot = hlf_class.GetEtot().reshape(-1, 1)
     E_layer = []
     for layer_id in hlf_class.GetElayers():
         E_layer.append(hlf_class.GetElayers()[layer_id].reshape(-1, 1))
@@ -86,11 +87,22 @@ def prepare_high_data_for_classifier(voxel_orig, E_inc_orig, hlf_class, label, c
         EC_phis.append(hlf_class.GetECPhis()[layer_id].reshape(-1, 1))
         Width_etas.append(hlf_class.GetWidthEtas()[layer_id].reshape(-1, 1))
         Width_phis.append(hlf_class.GetWidthPhis()[layer_id].reshape(-1, 1))
+    Sparsity = []
+    for layer_id in hlf_class.GetSparsity():
+        Sparsity.append(hlf_class.GetSparsity()[layer_id].reshape(-1, 1))
+    EC_R = []
+    Width_EC_R = []
+    for layer_id in hlf_class.GetECR():
+        EC_R.append(hlf_class.GetECR()[layer_id].reshape(-1, 1))
+        Width_EC_R.append(hlf_class.GetWidthR()[layer_id].reshape(-1, 1))
     E_layer = np.concatenate(E_layer, axis=1)
     EC_etas = np.concatenate(EC_etas, axis=1)
     EC_phis = np.concatenate(EC_phis, axis=1)
     Width_etas = np.concatenate(Width_etas, axis=1)
     Width_phis = np.concatenate(Width_phis, axis=1)
+    Sparsity = np.concatenate(Sparsity, axis=1)
+    EC_R = np.concatenate(EC_R, axis=1)
+    Width_EC_R = np.concatenate(Width_EC_R, axis=1)
     ret = np.concatenate(
         [
             np.log10(E_inc),
@@ -99,6 +111,10 @@ def prepare_high_data_for_classifier(voxel_orig, E_inc_orig, hlf_class, label, c
             EC_phis / 1e2,
             Width_etas / 1e2,
             Width_phis / 1e2,
+            np.log10(E_tot + 1e-8),
+            Sparsity,
+            EC_R / 1e2,
+            Width_EC_R / 1e2,
             label * np.ones_like(E_inc),
         ],
         axis=1,
@@ -165,8 +181,9 @@ def compute_fpd_kpd(
     dataset_name=None,
     min_samples=10000,
     batch_size=10000,
+    compute_kpd=False,
 ):
-    """Compute FPD and KPD between generated and reference calorimeter showers.
+    """Compute FPD and optional KPD between generated and reference showers.
 
     Args:
         generated_showers: numpy array of generated shower voxels, shape (N, num_voxels)
@@ -177,11 +194,12 @@ def compute_fpd_kpd(
         xml_filename: path to the CaloChallenge binning XML file
         geometry: optional geometry name used to infer particle/XML defaults
         cut: energy cut threshold (default 0.0)
-        output_dir: optional directory to save FPD/KPD results as a text file
+        output_dir: optional directory to save metric results as a text file
         dataset_name: optional dataset name for the output filename
+        compute_kpd: whether to also compute KPD. Defaults to False.
 
     Returns:
-        dict with keys: fpd_val, fpd_err, kpd_val, kpd_err
+        dict with keys: fpd_val, fpd_err, and optionally kpd_val, kpd_err
     """
     import jetnet
 
@@ -226,23 +244,29 @@ def compute_fpd_kpd(
         reference_showers, reference_energy, hlf_ref, 1.0, cut=cut
     )[:, :-1]
 
-    # Compute FPD and KPD with the same defaults used by the original
-    # vit4hep `experiments.calo_utils.ugr_evaluation.evaluate.py` path after
-    # the caller has converted showers into evaluator space.
+    # Compute FPD with the same defaults used by the original vit4hep
+    # `experiments.calo_utils.ugr_evaluation.evaluate.py` path after the
+    # caller has converted showers into evaluator space.
     logger.info("Computing FPD...")
     fpd_val, fpd_err = jetnet.evaluation.fpd(
         reference_array, source_array, min_samples=min_samples
     )
-    logger.info("Computing KPD...")
-    kpd_val, kpd_err = jetnet.evaluation.kpd(
-        reference_array, source_array, batch_size=batch_size
-    )
+    result_lines = [f"FPD (x10^3): {fpd_val * 1e3:.4f} ± {fpd_err * 1e3:.4f}"]
+    results = {
+        "fpd_val": fpd_val,
+        "fpd_err": fpd_err,
+    }
+    if compute_kpd:
+        logger.info("Computing KPD...")
+        kpd_val, kpd_err = jetnet.evaluation.kpd(
+            reference_array, source_array, batch_size=batch_size
+        )
+        result_lines.append(f"KPD (x10^3): {kpd_val * 1e3:.4f} ± {kpd_err * 1e3:.4f}")
+        results["kpd_val"] = kpd_val
+        results["kpd_err"] = kpd_err
 
-    result_str = (
-        f"FPD (x10^3): {fpd_val * 1e3:.4f} ± {fpd_err * 1e3:.4f}\n"
-        f"KPD (x10^3): {kpd_val * 1e3:.4f} ± {kpd_err * 1e3:.4f}"
-    )
-    logger.info(f"FPD/KPD results:\n{result_str}")
+    result_str = "\n".join(result_lines)
+    logger.info("FPD/KPD results:\n%s", result_str)
 
     # Optionally save to file
     if output_dir is not None:
@@ -253,8 +277,5 @@ def compute_fpd_kpd(
             f.write(result_str)
 
     return {
-        "fpd_val": fpd_val,
-        "fpd_err": fpd_err,
-        "kpd_val": kpd_val,
-        "kpd_err": kpd_err,
+        **results,
     }

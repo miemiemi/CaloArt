@@ -24,6 +24,7 @@ NUM_SHOWERS="${NUM_SHOWERS:-}"
 NOISE_LEVEL="${NOISE_LEVEL:-5.0e-07}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 DATASET_NAME="${DATASET_NAME:-}"
+COMPUTE_KPD="${COMPUTE_KPD:-false}"
 
 CMD=(
   python
@@ -42,6 +43,9 @@ if [[ -n "${OUTPUT_DIR}" ]]; then
 fi
 if [[ -n "${DATASET_NAME}" ]]; then
   CMD+=(--dataset-name "${DATASET_NAME}")
+fi
+if [[ "${COMPUTE_KPD}" == "true" ]]; then
+  CMD+=(--compute-kpd)
 fi
 
 printf 'Launching:'

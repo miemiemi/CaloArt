@@ -49,6 +49,8 @@ class HighLevelFeatures:
         self.width_etas = {}
         self.width_phis = {}
         self.sparsity = {}
+        self.EC_r = {}
+        self.width_r = {}
         self.weighted_depth_a = {}
         self.weighted_depth_r = {}
         self.weighted_depth_ga = {}
@@ -64,8 +66,13 @@ class HighLevelFeatures:
             self.color = self.colors[0]
 
         self.num_voxel = []
+        self.radial_center_mult = {}
         for idx, r_values in enumerate(self.r_edges):
             self.num_voxel.append((len(r_values) - 1) * self.num_alpha[idx])
+            self.radial_center_mult[self.relevantLayers[idx]] = np.array(
+                self.num_alpha[idx]
+                * [(r_values[i] + r_values[i + 1]) * 0.5 for i in range(len(r_values) - 1)]
+            )
 
     def _calculate_EC(self, eta, phi, energy):
         eta_EC = (eta * energy).sum(axis=-1) / (energy.sum(axis=-1) + 1e-16)
@@ -87,9 +94,26 @@ class HighLevelFeatures:
         phi_width = np.sqrt((phi_width - phi_EC**2).clip(min=0.0))
         return eta_EC, phi_EC, eta_width, phi_width
 
-    def _calculate_sparsity(self, layer_data):
+    def GetECandWidthR(self, r_layer, energy_layer):
+        """Computes center of energy in r as well as its width per layer."""
+        r_EC = self._calculate_EC_r(r_layer, energy_layer)
+        r_width = self._calculate_Width_r(r_layer, energy_layer)
+        r_width = np.sqrt((r_width - r_EC**2).clip(min=0.0))
+        return r_EC, r_width
+
+    def _calculate_sparsity(self, layer_data, threshold=0.0):
         """Computes the sparsity of the given layer"""
-        return (layer_data > 0).mean(axis=1)
+        return 1.0 - (layer_data > threshold).mean(axis=-1)
+
+    def _calculate_EC_r(self, radial_center, energy):
+        r_EC = (radial_center * energy).sum(axis=-1) / (energy.sum(axis=-1) + 1e-16)
+        return r_EC
+
+    def _calculate_Width_r(self, radial_center, energy):
+        r_width = (radial_center * radial_center * energy).sum(axis=-1) / (
+            energy.sum(axis=-1) + 1e-16
+        )
+        return r_width
 
     def _calculate_WeightedDepth(self, energy_layer, layer):
         """Calculate the energy sum weighted by the layer index"""
@@ -162,19 +186,21 @@ class HighLevelFeatures:
         for n in range(len(self.r_edges[0]) - 1):
             self.Eradial[n] = self._calculate_Eradial(energy_calo, n)
 
-    def CalculateFeatures(self, data):
+    def CalculateFeatures(self, data, threshold=0.0):
         """Computes all high-level features for the given data"""
         self.E_tot = data.sum(axis=-1)
 
         for L in self.relevantLayers:
-            E_layer = data[:, self.bin_edges[L] : self.bin_edges[L + 1]].sum(axis=-1)
+            layer_data = data[:, self.bin_edges[L] : self.bin_edges[L + 1]]
+            E_layer = layer_data.sum(axis=-1)
             self.E_layers[L] = E_layer
-
-            self.sparsity[L] = self._calculate_sparsity(
-                data[:, self.bin_edges[L] : self.bin_edges[L + 1]]
-            )
+            self.sparsity[L] = self._calculate_sparsity(layer_data, threshold=threshold)
 
         for L in self.relevantLayers:
+            self.EC_r[L], self.width_r[L] = self.GetECandWidthR(
+                self.radial_center_mult[L],
+                data[:, self.bin_edges[L] : self.bin_edges[L + 1]],
+            )
             if L in self.layersBinnedInAlpha:
                 (
                     self.EC_etas[L],
@@ -185,10 +211,6 @@ class HighLevelFeatures:
                     self.eta_all_layers[L],
                     self.phi_all_layers[L],
                     data[:, self.bin_edges[L] : self.bin_edges[L + 1]],
-                )
-
-                self.sparsity[L] = self._calculate_sparsity(
-                    data[:, self.bin_edges[L] : self.bin_edges[L + 1]]
                 )
         self.GetWeightedDepths(data)
         self.GetGroupedWeightedDepths(data)
@@ -360,6 +382,12 @@ class HighLevelFeatures:
 
     def GetSparsity(self):
         return self.sparsity
+
+    def GetECR(self):
+        return self.EC_r
+
+    def GetWidthR(self):
+        return self.width_r
 
     def GetWeightedDepthA(self):
         return self.weighted_depth_a

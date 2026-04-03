@@ -4,7 +4,7 @@ import h5py
 import numpy as np
 import torch
 
-from src.data.geometry import GEOMETRY
+from src.data.geometry import GEOMETRY, get_geometry, infer_geometry_name, set_geometry
 from src.data.utils import load_showers
 from src.utils import get_logger
 
@@ -43,6 +43,7 @@ class CaloShowerDataset(torch.utils.data.Dataset):
         need_geo_condn=False,
         train_on=None,
         is_ccd=False,
+        ccd_geometry=None,
         **kwargs
     ):
         if root_path is None and files is None:
@@ -56,10 +57,26 @@ class CaloShowerDataset(torch.utils.data.Dataset):
         self.need_geo_condn = need_geo_condn
         self.train_on = train_on
         self.is_ccd = is_ccd
+        self.ccd_geometry = ccd_geometry
         self.use_cond_info = use_cond_info
         self.max_num_showers = max_num_showers
 
         total_num_data, shower_shape = self._get_total_data()
+
+        if self.is_ccd:
+            raw_flat_size = int(np.prod(shower_shape))
+            inferred_geometry = infer_geometry_name(raw_flat_size)
+            if self.ccd_geometry is None:
+                self.ccd_geometry = inferred_geometry
+            elif self.ccd_geometry != inferred_geometry:
+                raise ValueError(
+                    f"CCD geometry mismatch: config requested {self.ccd_geometry}, "
+                    f"but file shape implies {inferred_geometry} ({raw_flat_size} cells)."
+                )
+            self.geometry = get_geometry(self.ccd_geometry)
+            set_geometry(self.ccd_geometry)
+        else:
+            self.geometry = None
 
         self.showers = np.zeros([total_num_data] + list(shower_shape), dtype=np.float32)
         self.energy = np.zeros([total_num_data], dtype=np.float32)
@@ -109,7 +126,12 @@ class CaloShowerDataset(torch.utils.data.Dataset):
         if is_ccd:
             self.showers = (
                 self.showers
-                .reshape(self.showers.shape[0], GEOMETRY.N_CELLS_Z, GEOMETRY.N_CELLS_PHI, GEOMETRY.N_CELLS_R)
+                .reshape(
+                    self.showers.shape[0],
+                    self.geometry.N_CELLS_Z,
+                    self.geometry.N_CELLS_PHI,
+                    self.geometry.N_CELLS_R,
+                )
                 .transpose(0, 3, 2, 1)
                 * 0.033
             )

@@ -434,19 +434,20 @@ class ProfilePlotter(Plotter):
         """
         full_simulation_energy_per_layer = self._full_simulation.calc_event_energy_per_layer()
         ml_simulation_energy_per_layer = self._ml_simulation.calc_event_energy_per_layer()
+        num_layers = full_simulation_energy_per_layer.shape[1]
 
         if self._profile_type == ProfileType.LONGITUDINAL:
             observable_name = "LongEventEnergy"
             number_of_plots_in_row = 9
-            number_of_plots_in_column = 5
         elif self._profile_type == ProfileType.RADIAL:
             observable_name = "RadEventEnergy"
             number_of_plots_in_row = 3
-            number_of_plots_in_column = 3
         elif self._profile_type == ProfileType.AZIMUTHAL:
             observable_name = "AzimEventEnergy"
             number_of_plots_in_row = 4
-            number_of_plots_in_column = 4
+
+        number_of_plots_in_row = min(number_of_plots_in_row, num_layers)
+        number_of_plots_in_column = int(np.ceil(num_layers / number_of_plots_in_row))
 
         bins = np.linspace(
             np.min(full_simulation_energy_per_layer - 10), np.max(full_simulation_energy_per_layer + 10), 25
@@ -455,10 +456,11 @@ class ProfilePlotter(Plotter):
         fig, ax = plt.subplots(
             number_of_plots_in_column,
             number_of_plots_in_row,
-            figsize=(20, 15),
+            figsize=(4 * number_of_plots_in_row, 3.5 * number_of_plots_in_column),
             sharex="all",
             sharey="all",
             constrained_layout=True,
+            squeeze=False,
         )
 
         emds = []
@@ -490,8 +492,13 @@ class ProfilePlotter(Plotter):
             ax[i][j].set_yscale("log")
             ax[i][j].tick_params(axis="both", which="major", labelsize=10)
 
-            if i == number_of_plots_in_column - 1 and j == number_of_plots_in_row - 1:
+            if layer_idx == num_layers - 1:
                 ax[i][j].legend(loc="upper right", fontsize=13)
+
+        for unused_idx in range(num_layers, number_of_plots_in_row * number_of_plots_in_column):
+            i = unused_idx // number_of_plots_in_row
+            j = unused_idx % number_of_plots_in_row
+            ax[i][j].set_visible(False)
 
         mean_emd = sum(emds) / len(emds)
 

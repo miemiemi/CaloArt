@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 
+from src.data.geometry import set_geometry
 from src.evaluation.observables import AzimuthalProfile, LongitudinalProfile, RadialProfile, Shower
 from src.evaluation.plotters import ProfilePlotter, ShowerPlotter
 from src.utils import get_logger
@@ -22,6 +23,9 @@ def compare_observables(
     convert_GeV_to_MeV: bool = True,
     clip_to_fullsim: bool = True,
 ):
+    if geometry.startswith("CCD"):
+        set_geometry(geometry)
+
     save_dir.mkdir(parents=True, exist_ok=True)
 
     if not keep_previous:

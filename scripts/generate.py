@@ -71,7 +71,14 @@ def main(cfg: DictConfig):
             logger.warning(f"File {output_path} already exists, overwriting")
             output_path.unlink()
 
-        save_showers(generated_events, energy, phi, theta, output_path)
+        save_showers(
+            generated_events,
+            energy,
+            phi,
+            theta,
+            output_path,
+            is_ccd=geometry.startswith("CCD"),
+        )
         logger.info(f"Saved generated events to {output_path}")
 
 

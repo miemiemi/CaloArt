@@ -70,10 +70,10 @@ class Standarize:
         self.std = std
 
     def transform(self, x, _energy):
-        return (x - self.mean) / self.std * 0.5
+        return (x - self.mean) / self.std
 
     def inverse_transform(self, x, _energy):
-        return (x * self.std * 2) + self.mean
+        return (x * self.std) + self.mean
 
 
 class ScaleByIncidentEnergy:
@@ -157,6 +157,14 @@ class ShowerPreprocessor:
     def inverse_transform(self, showers, energy=None):
         for step in reversed(self.pipeline):
             showers = step.inverse_transform(showers, energy)
+
+        return showers
+
+    def inverse_transform_with_trace(self, showers, energy=None, trace_fn=None):
+        for step in reversed(self.pipeline):
+            showers = step.inverse_transform(showers, energy)
+            if trace_fn is not None:
+                trace_fn(type(step).__name__, showers)
 
         return showers
 
@@ -292,15 +300,28 @@ class CaloShowerPreprocessor:
 
         return showers, conditions
 
-    def inverse_transform(self, showers=None, conditions=None):
+    def inverse_transform(self, showers=None, conditions=None, trace_fn=None):
         if showers is not None and conditions is not None:
             conditions = self.conditions_preprocessor.inverse_transform(conditions)
             energy, *_ = conditions
-            showers = self.shower_preprocessor.inverse_transform(showers, energy)
+            if trace_fn is None:
+                showers = self.shower_preprocessor.inverse_transform(showers, energy)
+            else:
+                showers = self.shower_preprocessor.inverse_transform_with_trace(
+                    showers,
+                    energy,
+                    trace_fn=trace_fn,
+                )
         elif conditions is not None:
             conditions = self.conditions_preprocessor.inverse_transform(conditions)
         elif showers is not None:
-            showers = self.shower_preprocessor.inverse_transform(showers)
+            if trace_fn is None:
+                showers = self.shower_preprocessor.inverse_transform(showers)
+            else:
+                showers = self.shower_preprocessor.inverse_transform_with_trace(
+                    showers,
+                    trace_fn=trace_fn,
+                )
         else:
             raise ValueError("Expected either showers or conditions")
 

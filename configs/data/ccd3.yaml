@@ -1,0 +1,15 @@
+# CCD3 dataset paths
+train:
+  files:
+    - "/aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets/dataset_3_1.hdf5"
+    - "/aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets/dataset_3_2.hdf5"
+  use_cond_info: true
+  is_ccd: true
+  ccd_geometry: CCD3
+valid:
+  files:
+    - "/aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets/dataset_3_3.hdf5"
+    - "/aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets/dataset_3_4.hdf5"
+  use_cond_info: true
+  is_ccd: true
+  ccd_geometry: CCD3

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compute FPD/KPD for a generated HDF5 file using the local project pipeline."""
+"""Compute FPD and optional KPD for a generated HDF5 file."""
 
 from __future__ import annotations
 
@@ -31,7 +31,9 @@ def load_h5(path: Path, geometry: str, num_showers: int | None):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Compute project-local FPD/KPD from raw HDF5 files.")
+    parser = argparse.ArgumentParser(
+        description="Compute project-local FPD and optional KPD from raw HDF5 files."
+    )
     parser.add_argument("--generated-file", type=Path, required=True, help="Generated HDF5 file.")
     parser.add_argument("--reference-file", type=Path, required=True, help="Reference HDF5 file.")
     parser.add_argument("--geometry", default="CCD2", help="Geometry name, e.g. CCD2.")
@@ -57,6 +59,11 @@ def parse_args():
         "--dataset-name",
         default=None,
         help="Optional dataset tag for the output filename.",
+    )
+    parser.add_argument(
+        "--compute-kpd",
+        action="store_true",
+        help="Also compute KPD. Disabled by default.",
     )
     return parser.parse_args()
 
@@ -95,6 +102,7 @@ def main():
         cut=threshold,
         output_dir=output_dir,
         dataset_name=dataset_name,
+        compute_kpd=args.compute_kpd,
     )
 
     print(f"generated_file={args.generated_file}")
@@ -107,10 +115,11 @@ def main():
         "FPD (x10^3): "
         f"{results['fpd_val'] * 1e3:.4f} ± {results['fpd_err'] * 1e3:.4f}"
     )
-    print(
-        "KPD (x10^3): "
-        f"{results['kpd_val'] * 1e3:.4f} ± {results['kpd_err'] * 1e3:.4f}"
-    )
+    if "kpd_val" in results:
+        print(
+            "KPD (x10^3): "
+            f"{results['kpd_val'] * 1e3:.4f} ± {results['kpd_err'] * 1e3:.4f}"
+        )
 
 
 if __name__ == "__main__":

@@ -14,12 +14,12 @@ from accelerate import Accelerator
 from accelerate.data_loader import prepare_data_loader
 from accelerate.utils import broadcast
 from accelerate.scheduler import AcceleratedScheduler
-from omegaconf import OmegaConf
+from omegaconf import ListConfig, OmegaConf
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
-from src.data.dataset import CaloShowerDataset
+from src.data.dataset import CaloShowerDataset, DummyDataset
 from src.data.preprocessing import CaloShowerPreprocessor, cut_below_noise_level
 from src.data.utils import save_showers
 from src.evaluation.utils import compare_observables
@@ -134,8 +134,11 @@ class DiffusionTrainer(object):
         save_best_and_last_only=False,
         load_best_model_at_end=False,
         resume_from_checkpoint=None,
+        test_num_showers=None,
         enable_plots=True,
         enable_fpd=False,
+        save_test_model_artifact=False,
+        save_generated=False,
         fpd_config=None,
         **kwargs,
     ):
@@ -256,9 +259,12 @@ class DiffusionTrainer(object):
         self.logging_strategy, self.logging_steps = parse_strategy(logging_strategy, logging_steps)
         self.valid_strategy, self.valid_steps = parse_strategy(valid_strategy, valid_steps)
         self.test_strategy, self.test_steps = parse_strategy(test_strategy, test_steps)
+        self.test_num_showers = test_num_showers
         self.test_conditions = test_conditions
         self.enable_plots = enable_plots
         self.enable_fpd = enable_fpd
+        self.save_test_model_artifact = save_test_model_artifact
+        self.save_generated = save_generated
         self.fpd_config = dict(fpd_config or {})
 
         self.plot_dir = self.output_dir / "plots"
@@ -483,41 +489,70 @@ class DiffusionTrainer(object):
         logger.info("Testing...")
         step_output_dir = self.plot_dir / f"{self.state.step}"
         model_artifact_path = None
-        if self.enable_fpd and self.accelerator.is_main_process:
+        if self.save_test_model_artifact and self.accelerator.is_main_process:
             step_output_dir.mkdir(parents=True, exist_ok=True)
             model_filename = "ema_model_with_config.pt" if self.use_ema else "model_with_config.pt"
             model_artifact_path = step_output_dir / model_filename
             self.accelerator.unwrap_model(model).save_state(model_artifact_path)
 
-        # num_showers should be a value for all sub test
-        fpd_num_showers = self.fpd_config.get("num_showers")
-        if fpd_num_showers is not None:
-            fpd_num_showers = int(fpd_num_showers)
-        save_generated_for_fpd = bool(self.fpd_config.get("save_generated", False))
+        # Test-time sample count is shared across all test conditions.
+        test_num_showers = self.test_num_showers
+        if test_num_showers is not None:
+            test_num_showers = int(test_num_showers)
+            
+        save_generated = bool(self.save_generated or self.fpd_config.get("save_generated", False))
+        compute_kpd = bool(self.fpd_config.get("compute_kpd", False))
         metric_fpd_config = {
             key: value
             for key, value in self.fpd_config.items()
-            if key not in {"num_showers", "save_generated"}
+            if key not in {"num_showers", "save_generated", "compute_kpd"}
         }
 
         for geometry, energy, phi, theta, fullsim_path in self.test_conditions:
             conditions_str = get_conditions_str(geometry, energy, phi, theta)
             output_dir = self.plot_dir / f"{self.state.step}/{conditions_str}"
+            postprocess_done_path = output_dir / ".postprocess_done"
+            postprocess_failed_path = output_dir / ".postprocess_failed"
+            needs_main_postprocess = self.enable_plots or save_generated or self.enable_fpd
+
+            if needs_main_postprocess and self.accelerator.is_main_process:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                postprocess_done_path.unlink(missing_ok=True)
+                postprocess_failed_path.unlink(missing_ok=True)
+            if needs_main_postprocess:
+                # Keep collectives short: all ranks start post-processing from the same state,
+                # then non-main ranks wait on filesystem markers instead of NCCL.
+                self.accelerator.wait_for_everyone()
+
+            if isinstance(fullsim_path, (list, tuple, ListConfig)):
+                fullsim_files = list(fullsim_path)
+            else:
+                fullsim_files = [fullsim_path]
 
             if self.need_geo_condn:
-                file_struc = [[geometry, fullsim_path],]
+                file_struc = [[geometry, path] for path in fullsim_files]
             else:
-                file_struc = [fullsim_path,]
+                file_struc = fullsim_files
 
             is_ccd = geometry.startswith("CCD")
-            if self.enable_fpd and fpd_num_showers is not None:
-                max_num_showers = fpd_num_showers
+            if test_num_showers is not None:
+                max_num_showers = test_num_showers
             elif is_ccd:
                 max_num_showers = 1000
             else:
                 max_num_showers = None
 
-            dataset = CaloShowerDataset(files=file_struc, need_geo_condn=self.need_geo_condn, train_on=self.train_on, is_ccd=is_ccd, max_num_showers=max_num_showers)
+            if self.accelerator.is_main_process:
+                dataset = CaloShowerDataset(
+                    files=file_struc,
+                    need_geo_condn=self.need_geo_condn,
+                    train_on=self.train_on,
+                    is_ccd=is_ccd,
+                    max_num_showers=max_num_showers,
+                )
+            else:
+                dataset = DummyDataset()
+            self.accelerator.wait_for_everyone()
             dataloader = self._get_dataloader(dataset, self.batch_size, shuffle=False)
 
             num_samples = len(dataset)
@@ -568,96 +603,113 @@ class DiffusionTrainer(object):
                 generated_events = np.concatenate(generated_events_list)
                 incident_energy = np.concatenate(incident_energy_list)
 
-            if self.accelerator.is_main_process:
-                if self.enable_plots:           # still 1000 for keep with calodit2
-                    plot_original_events = original_events
-                    plot_generated_events = generated_events
-                    if is_ccd and len(original_events) > 1000:
-                        plot_original_events = original_events[:1000]
-                        plot_generated_events = generated_events[:1000]
-                    observables = compare_observables(
-                        plot_original_events, plot_generated_events, output_dir, geometry, energy, phi, theta
-                    )
-                    for observable_name, plot_emd_dict in observables.items():
-                        self.writer.add_scalar(
-                            f"Observables/{conditions_str.replace('_', ' ')}/EMD {observable_name}",
-                            plot_emd_dict["emd"],
-                            global_step=self.state.step,
-                        )
-                        if self.use_wandb:
-                            wandb.log({
-                                f"Observables/{conditions_str.replace('_', ' ')}/{observable_name}": [wandb.Image(str(plot_emd_dict["plot_path"]))]
-                            })
-
-                if self.enable_fpd:
-                    from src.evaluation.fpd_kpd import (
-                        compute_fpd_kpd,
-                        prepare_fpd_inputs,
-                    )
-
-                    if save_generated_for_fpd:
-                        output_dir.mkdir(parents=True, exist_ok=True)
-                        generated_output_path = output_dir / "generated.h5"
-                        if generated_output_path.exists():
-                            logger.warning(
-                                "File %s already exists, overwriting",
-                                generated_output_path,
+            if needs_main_postprocess:
+                if self.accelerator.is_main_process:
+                    try:
+                        if self.enable_plots:           # still 1000 for keep with calodit2
+                            plot_original_events = original_events
+                            plot_generated_events = generated_events
+                            if is_ccd and len(original_events) > 1000:
+                                plot_original_events = original_events[:1000]
+                                plot_generated_events = generated_events[:1000]
+                            observables = compare_observables(
+                                plot_original_events, plot_generated_events, output_dir, geometry, energy, phi, theta
                             )
-                            generated_output_path.unlink()
-                        save_showers(
-                            generated_events,
-                            incident_energy,
-                            phi,
-                            theta,
-                            generated_output_path,
-                            is_ccd=is_ccd,
-                        )
-                        logger.info("Saved generated events to %s", generated_output_path)
+                            for observable_name, plot_emd_dict in observables.items():
+                                self.writer.add_scalar(
+                                    f"Observables/{conditions_str.replace('_', ' ')}/EMD {observable_name}",
+                                    plot_emd_dict["emd"],
+                                    global_step=self.state.step,
+                                )
+                                if self.use_wandb:
+                                    wandb.log({
+                                        f"Observables/{conditions_str.replace('_', ' ')}/{observable_name}": [wandb.Image(str(plot_emd_dict["plot_path"]))]
+                                    })
 
-                    gen_showers_mev, gen_energy_mev = prepare_fpd_inputs(
-                        generated_events, incident_energy, geometry=geometry
-                    )
-                    ref_showers_mev, ref_energy_mev = prepare_fpd_inputs(
-                        original_events, incident_energy, geometry=geometry
-                    )
+                        if save_generated:
+                            generated_output_path = output_dir / "generated.h5"
+                            if generated_output_path.exists():
+                                logger.warning(
+                                    "File %s already exists, overwriting",
+                                    generated_output_path,
+                                )
+                                generated_output_path.unlink()
+                            save_showers(
+                                generated_events,
+                                incident_energy,
+                                phi,
+                                theta,
+                                generated_output_path,
+                                is_ccd=is_ccd,
+                            )
+                            logger.info("Saved generated events to %s", generated_output_path)
 
-                    fpd_results = compute_fpd_kpd(
-                        generated_showers=gen_showers_mev,
-                        reference_showers=ref_showers_mev,
-                        generated_energy=gen_energy_mev,
-                        reference_energy=ref_energy_mev,
-                        geometry=geometry,
-                        output_dir=output_dir,
-                        dataset_name=conditions_str,
-                        **metric_fpd_config,
-                    )
+                        if self.enable_fpd:
+                            from src.evaluation.fpd_kpd import (
+                                compute_fpd_kpd,
+                                prepare_fpd_inputs,
+                            )
 
-                    # Log to tensorboard
-                    for key in ["fpd_val", "fpd_err", "kpd_val", "kpd_err"]:
-                        self.writer.add_scalar(
-                            f"FPD_KPD/{conditions_str.replace('_', ' ')}/{key}",
-                            fpd_results[key],
-                            global_step=self.state.step,
-                        )
-                    if self.use_wandb:
-                        wandb.log({
-                            f"FPD_KPD/{conditions_str}/{k}": v
-                            for k, v in fpd_results.items()
-                        })
+                            gen_showers_mev, gen_energy_mev = prepare_fpd_inputs(
+                                generated_events, incident_energy, geometry=geometry
+                            )
+                            ref_showers_mev, ref_energy_mev = prepare_fpd_inputs(
+                                original_events, incident_energy, geometry=geometry
+                            )
 
-                    score_payload = {
-                        "step": self.state.step,
-                        "geometry": geometry,
-                        "energy": energy,
-                        "phi": phi,
-                        "theta": theta,
-                        "model_path": str(model_artifact_path) if model_artifact_path is not None else None,
-                        **{
-                            key: value.item() if isinstance(value, np.generic) else value
-                            for key, value in fpd_results.items()
-                        },
-                    }
-                    OmegaConf.save(score_payload, output_dir / "fpd_kpd.yaml")
+                            fpd_results = compute_fpd_kpd(
+                                generated_showers=gen_showers_mev,
+                                reference_showers=ref_showers_mev,
+                                generated_energy=gen_energy_mev,
+                                reference_energy=ref_energy_mev,
+                                geometry=geometry,
+                                output_dir=output_dir,
+                                dataset_name=conditions_str,
+                                compute_kpd=compute_kpd,
+                                **metric_fpd_config,
+                            )
+
+                            # Log whichever metrics were requested.
+                            for key in fpd_results:
+                                self.writer.add_scalar(
+                                    f"FPD_KPD/{conditions_str.replace('_', ' ')}/{key}",
+                                    fpd_results[key],
+                                    global_step=self.state.step,
+                                )
+                            if self.use_wandb:
+                                wandb.log({
+                                    f"FPD_KPD/{conditions_str}/{k}": v
+                                    for k, v in fpd_results.items()
+                                })
+
+                            score_payload = {
+                                "step": self.state.step,
+                                "geometry": geometry,
+                                "energy": energy,
+                                "phi": phi,
+                                "theta": theta,
+                                "model_path": str(model_artifact_path) if model_artifact_path is not None else None,
+                                **{
+                                    key: value.item() if isinstance(value, np.generic) else value
+                                    for key, value in fpd_results.items()
+                                },
+                            }
+                            OmegaConf.save(score_payload, output_dir / "fpd_kpd.yaml")
+                    except Exception as exc:
+                        postprocess_failed_path.write_text(f"{type(exc).__name__}: {exc}\n")
+                        raise
+                    else:
+                        postprocess_done_path.write_text("done\n")
+                else:
+                    while True:
+                        if postprocess_failed_path.exists():
+                            raise RuntimeError(
+                                f"Main-process test post-processing failed for {conditions_str}: "
+                                f"{postprocess_failed_path.read_text().strip()}"
+                            )
+                        if postprocess_done_path.exists():
+                            break
+                        time.sleep(5)
 
             self.accelerator.wait_for_everyone()
 
