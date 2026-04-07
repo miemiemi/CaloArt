@@ -18,6 +18,10 @@ CHUNK_SHOWERS="${CHUNK_SHOWERS:-64}"
 EPS_LIST="${EPS_LIST:-1e-8 1e-7 5e-7 1e-6}"
 NOISE_THRESHOLDS="${NOISE_THRESHOLDS:-1.65e-7 5e-7}"
 SUGGESTED_NOISE_LEVEL="${SUGGESTED_NOISE_LEVEL:-5e-7}"
+RAW_CUT_NOISE_LEVEL="${RAW_CUT_NOISE_LEVEL:-0}"
+SCALE_BY_INCIDENT_ENERGY="${SCALE_BY_INCIDENT_ENERGY:-0}"
+SCALE_BY_FACTOR="${SCALE_BY_FACTOR:-1}"
+OUTPUT_JSON="${OUTPUT_JSON:-}"
 
 mkdir -p "${REPO_DIR}/logs/slurm"
 
@@ -38,6 +42,10 @@ echo "CHUNK_SHOWERS=${CHUNK_SHOWERS}"
 echo "EPS_LIST=${EPS_LIST}"
 echo "NOISE_THRESHOLDS=${NOISE_THRESHOLDS}"
 echo "SUGGESTED_NOISE_LEVEL=${SUGGESTED_NOISE_LEVEL}"
+echo "RAW_CUT_NOISE_LEVEL=${RAW_CUT_NOISE_LEVEL}"
+echo "SCALE_BY_INCIDENT_ENERGY=${SCALE_BY_INCIDENT_ENERGY}"
+echo "SCALE_BY_FACTOR=${SCALE_BY_FACTOR}"
+echo "OUTPUT_JSON=${OUTPUT_JSON:-none}"
 nvidia-smi || true
 
 read -r -a DATA_FILES_ARR <<< "${DATA_FILES}"
@@ -55,6 +63,19 @@ CMD+=(--chunk-showers "${CHUNK_SHOWERS}")
 CMD+=(--eps "${EPS_LIST_ARR[@]}")
 CMD+=(--noise-thresholds "${NOISE_THRESHOLDS_ARR[@]}")
 CMD+=(--suggested-noise-level "${SUGGESTED_NOISE_LEVEL}")
+CMD+=(--raw-cut-noise-level "${RAW_CUT_NOISE_LEVEL}")
+
+if [[ "${SCALE_BY_INCIDENT_ENERGY}" == "1" ]]; then
+  CMD+=(--scale-by-incident-energy)
+fi
+
+if [[ "${SCALE_BY_FACTOR}" != "1" ]]; then
+  CMD+=(--scale-by-factor "${SCALE_BY_FACTOR}")
+fi
+
+if [[ -n "${OUTPUT_JSON}" ]]; then
+  CMD+=(--output-json "${OUTPUT_JSON}")
+fi
 
 printf 'Launching:'
 printf ' %q' "${CMD[@]}"

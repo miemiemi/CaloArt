@@ -1,0 +1,17 @@
+# CCD2 preprocessing pipeline with eps=1e-6 voxel stats and linear condition energy.
+steps:
+  - class_name: src.data.preprocessing.CutNoise
+    init_args:
+      noise_level: 5.0e-07
+      both_directions: false
+  - class_name: src.data.preprocessing.LogTransform
+    init_args:
+      eps: 1.0e-06
+  - class_name: src.data.preprocessing.Standarize
+    init_args:
+      mean: -12.2755409
+      std: 2.8429102
+condition_preprocessing:
+  energy_encoding: linear
+  energy_min: 1.0
+  energy_max: 1000.0

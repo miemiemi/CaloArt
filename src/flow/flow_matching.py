@@ -17,13 +17,14 @@ Conversions (given z_t and t):
 import torch
 import torch.nn as nn
 
-from src.flow.sampler import euler_ode_sample, heun_ode_sample, midpoint_ode_sample
+from src.flow.sampler import euler_ode_sample, heun_ode_sample, midpoint_ode_sample, rk4_ode_sample
 from src.method_base import MethodBase
 from src.utils import mean_flat
 
 
 PREDICT_MODES = ("pred_v", "pred_x1", "pred_eps")
 LOSS_TARGETS = ("v", "x1", "eps")
+TIME_BEHAVIOR_MODES = ("original", "jit_aligned")
 
 
 class FlowMatching(MethodBase):
@@ -38,8 +39,9 @@ class FlowMatching(MethodBase):
         logit_normal_std:   std  for logit-normal time sampling
         noise_scale:        scale of initial noise x₀
         t_eps:              small epsilon to avoid t=0 or t=1 singularities
+        time_behavior:      preset for t-related behavior — 'original' | 'jit_aligned'
         num_sample_steps:   default ODE steps for sampling
-        solver:             default ODE solver — 'euler' | 'heun' | 'midpoint'
+        solver:             default ODE solver — 'euler' | 'heun' | 'midpoint' | 'rk4'
     """
 
     def __init__(
@@ -52,12 +54,14 @@ class FlowMatching(MethodBase):
         logit_normal_std=1.0,
         noise_scale=1.0,
         t_eps=1e-5,
+        time_behavior="jit_aligned",
         num_sample_steps=50,
         solver="euler",
     ):
         super().__init__()
         assert predict_mode in PREDICT_MODES, f"predict_mode must be one of {PREDICT_MODES}, got '{predict_mode}'"
         assert loss_target in LOSS_TARGETS, f"loss_target must be one of {LOSS_TARGETS}, got '{loss_target}'"
+        assert time_behavior in TIME_BEHAVIOR_MODES, f"time_behavior must be one of {TIME_BEHAVIOR_MODES}, got '{time_behavior}'"
 
         self.model = model
         assert model.in_channels == model.out_channels, "input and output channels must match"
@@ -70,6 +74,7 @@ class FlowMatching(MethodBase):
         self.logit_normal_std = logit_normal_std
         self.noise_scale = noise_scale
         self.t_eps = t_eps
+        self.time_behavior = time_behavior
         self.num_sample_steps = num_sample_steps
         self.solver = solver
         self.record_condition_diagnostics = False
@@ -79,18 +84,36 @@ class FlowMatching(MethodBase):
     #                         Time sampling                                #
     # ------------------------------------------------------------------ #
 
+    def _should_clamp_sampled_t(self):
+        return self.time_behavior == "original" or self.predict_mode != "pred_x1"
+
+    def _should_use_pathwise_v_target(self):
+        return self.time_behavior == "jit_aligned" and self.predict_mode == "pred_x1"
+
+    def _should_clamp_inference_t(self):
+        return self.time_behavior == "original" or self.predict_mode != "pred_x1"
+
     def sample_time(self, batch_size, device):
-        """Sample timesteps t ∈ [t_eps, 1 - t_eps]."""
+        """Sample timesteps for training."""
+        clamp_time = self._should_clamp_sampled_t()
         if self.time_sampler == "uniform":
-            t = torch.rand(batch_size, device=device) * (1.0 - 2 * self.t_eps) + self.t_eps
+            t = torch.rand(batch_size, device=device)
+            if clamp_time:
+                t = t * (1.0 - 2 * self.t_eps) + self.t_eps
         elif self.time_sampler == "logit_normal":
             # t = sigmoid(N(mean, std^2))  — biases sampling towards the middle
             u = torch.randn(batch_size, device=device) * self.logit_normal_std + self.logit_normal_mean
             t = torch.sigmoid(u)
-            t = t.clamp(self.t_eps, 1.0 - self.t_eps)
+            if clamp_time:
+                t = t.clamp(self.t_eps, 1.0 - self.t_eps)
         else:
             raise ValueError(f"Unknown time_sampler: {self.time_sampler}")
         return t
+
+    def _get_v_target(self, x_0, x_1, z_t, te):
+        if self._should_use_pathwise_v_target():
+            return (x_1 - z_t) / (1.0 - te).clamp(min=self.t_eps)
+        return x_1 - x_0
 
     # ------------------------------------------------------------------ #
     #                   Conversion between representations                 #
@@ -178,7 +201,7 @@ class FlowMatching(MethodBase):
         z_t = (1.0 - te) * x_0 + te * x_1
 
         # 4. Ground truth velocity
-        v_target = x_1 - x_0
+        v_target = self._get_v_target(x_0, x_1, z_t, te)
 
         if self.record_condition_diagnostics and hasattr(self.model, "compute_condition_diagnostics"):
             self._last_condition_diagnostics = self.model.compute_condition_diagnostics(x_cond, t)
@@ -215,14 +238,16 @@ class FlowMatching(MethodBase):
         During sampling, we always need the velocity field to integrate the ODE.
         This function converts the raw model output back to velocity.
         """
-        # Keep sampling-time model inputs aligned with the training support.
-        t = t.clamp(self.t_eps, 1.0 - self.t_eps)
-        raw_pred = self.model(x, conditions, t)
+        if self._should_clamp_inference_t():
+            model_t = t.clamp(self.t_eps, 1.0 - self.t_eps)
+        else:
+            model_t = t
+        raw_pred = self.model(x, conditions, model_t)
         from_type = self.predict_mode.replace("pred_", "")
         if from_type == "v":
             return raw_pred
         else:
-            return self._convert(raw_pred, x, t, from_type, "v")
+            return self._convert(raw_pred, x, model_t, from_type, "v")
 
     @torch.inference_mode()
     def sample(
@@ -237,7 +262,7 @@ class FlowMatching(MethodBase):
         Args:
             conditions: tuple of condition tensors
             steps:      number of ODE integration steps (default: self.num_sample_steps)
-            solver:     'euler' | 'heun' | 'midpoint' (default: self.solver)
+            solver:     'euler' | 'heun' | 'midpoint' | 'rk4' (default: self.solver)
             progress:   show progress bar
 
         Returns:
@@ -258,6 +283,7 @@ class FlowMatching(MethodBase):
             "euler": euler_ode_sample,
             "heun": heun_ode_sample,
             "midpoint": midpoint_ode_sample,
+            "rk4": rk4_ode_sample,
         }[solver]
 
         # Solve ODE

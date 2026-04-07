@@ -19,4 +19,6 @@ init_args:
   use_rmsnorm: false
   use_checkpoint: false
   use_conv: false
+  use_bottleneck_patch_embed: false
+  bottleneck_patch_embed_dim: null
   initialization: vanilla

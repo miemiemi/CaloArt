@@ -38,11 +38,11 @@ CMD=(
   experiment.output_dir="${OUTPUT_DIR}"
   experiment.run_name="${RUN_NAME}"
   model.model_path="${MODEL_PATH}"
-  train.enable_plots="${ENABLE_PLOTS}"
-  train.enable_fpd="${ENABLE_FPD}"
-  train.test_num_showers="${TEST_NUM_SHOWERS}"
-  train.save_test_model_artifact="${SAVE_TEST_MODEL_ARTIFACT}"
-  train.save_generated="${SAVE_GENERATED}"
+  +train.enable_plots="${ENABLE_PLOTS}"
+  +train.enable_fpd="${ENABLE_FPD}"
+  +train.test_num_showers="${TEST_NUM_SHOWERS}"
+  +train.save_test_model_artifact="${SAVE_TEST_MODEL_ARTIFACT}"
+  +train.save_generated="${SAVE_GENERATED}"
   train.load_best_model_at_end=false
 )
 

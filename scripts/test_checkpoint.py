@@ -78,7 +78,11 @@ def main(cfg: DictConfig):
         saved_state = torch.load(model_path, map_location="cpu", weights_only=False)
         saved_cfg = saved_state.get("config")
         if saved_cfg is not None:
-            cfg = OmegaConf.merge(OmegaConf.create(saved_cfg), runtime_overrides)
+            saved_cfg = OmegaConf.create(saved_cfg)
+            # Allow checkpoint-only test jobs to inject additional train-time keys
+            # such as test_num_showers/save_generated even if the saved config predates them.
+            OmegaConf.set_struct(saved_cfg, False)
+            cfg = OmegaConf.merge(saved_cfg, runtime_overrides)
             cfg.model.model_path = model_path
             cfg.train.sampling_args = OmegaConf.create(
                 OmegaConf.to_container(cfg.sampling, resolve=False)
@@ -99,7 +103,10 @@ def main(cfg: DictConfig):
         )
         model = build_model_with_legacy_final_layer(cfg)
     if model.config is not None:
-        cfg = OmegaConf.merge(model.config, cfg)
+        model_cfg = OmegaConf.create(model.config)
+        OmegaConf.set_struct(model_cfg, False)
+        OmegaConf.set_struct(cfg, False)
+        cfg = OmegaConf.merge(model_cfg, cfg)
     model.save_config(cfg)
 
     logger.info(f"Resolved checkpoint test config:\n{OmegaConf.to_yaml(cfg)}")
@@ -118,6 +125,12 @@ def main(cfg: DictConfig):
     trainer.save_config(cfg)
     trainer._setup_logging()
     accelerator.wait_for_everyone()
+
+    test_step_override = cfg.train.get("test_step_override")
+    if test_step_override is not None:
+        trainer.state.step = int(test_step_override)
+        if accelerator.is_main_process:
+            logger.info("Overriding trainer.state.step to %s for checkpoint test output routing.", trainer.state.step)
 
     if accelerator.is_main_process:
         logger.info("Running trainer.test() from the loaded checkpoint...")

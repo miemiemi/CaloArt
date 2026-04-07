@@ -111,6 +111,79 @@ class VolumeEmbedder(nn.Module):
         )
 
 
+class BottleneckVolumeEmbedder(nn.Module):
+    """
+    3D bottleneck patch embedder.
+
+    This keeps the same tokenization contract as ``VolumeEmbedder`` but uses
+    a patch-strided ``Conv3d`` followed by a ``1x1x1`` projection, mirroring
+    the 2D ``BottleneckPatchEmbed`` design.
+    """
+
+    def __init__(
+        self,
+        input_size: list,
+        patch_size: list,
+        in_channels: int,
+        bottleneck_channels: int,
+        out_channels: int,
+        bias: bool = True,
+    ):
+        super().__init__()
+        if not isinstance(input_size, (tuple, list)) or len(input_size) != 3:
+            raise ValueError(f"input_size must be a tuple/list of length 3, got {input_size}")
+        if not isinstance(patch_size, (tuple, list)) or len(patch_size) != 3:
+            raise ValueError(f"patch_size must be a tuple/list of length 3, got {patch_size}")
+
+        self.patch_size = tuple(patch_size)
+        self.input_size = tuple(input_size)
+        self.in_channels = in_channels
+        self.bottleneck_channels = bottleneck_channels
+        self.out_channels = out_channels
+
+        self.grid_size = tuple([s // p for s, p in zip(self.input_size, self.patch_size)])
+        self.left_over = tuple(
+            [((g + 1) * p - s) % p for p, s, g in zip(self.patch_size, self.input_size, self.grid_size)]
+        )
+        self.grid_size = tuple([(s + l) // p for p, l, s in zip(self.patch_size, self.left_over, self.input_size)])
+        self.num_patches = math.prod(self.grid_size)
+
+        self.proj1 = nn.Conv3d(
+            in_channels,
+            bottleneck_channels,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+            bias=False,
+        )
+        self.proj2 = nn.Conv3d(
+            bottleneck_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        input: (B, C, X, Y, Z)
+        output: (B, X * Y * Z, D)
+        """
+        x = F.pad(x, (0, self.left_over[2], 0, self.left_over[1], 0, self.left_over[0]))
+        x = self.proj2(self.proj1(x))
+        x = rearrange(x, "b c x y z -> b (x y z) c")
+        return x
+
+    def extra_repr(self):
+        return (
+            f"input_size={self.input_size}, \n"
+            f"patch_size={self.patch_size}, \n"
+            f"in_channels={self.in_channels}, \n"
+            f"bottleneck_channels={self.bottleneck_channels}, \n"
+            f"out_channels={self.out_channels}, \n"
+            f"grid_size={self.grid_size}"
+        )
+
+
 class VolumeUnembedder(nn.Module):
     def __init__(
         self,
@@ -302,4 +375,3 @@ class ClassicDiTFinalLayer(nn.Module):
         if self.use_checkpoint:
             return torch.utils.checkpoint.checkpoint(self._forward, x, mod, use_reentrant=False)
         return self._forward(x, mod)
-

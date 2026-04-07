@@ -12,6 +12,7 @@ from src.models.modules import MultiHeadAttention
 from src.models.rope import RotaryPositionEmbedder
 from src.models.layers_3drope import (
     AbsolutePositionEmbedder,
+    BottleneckVolumeEmbedder,
     LayerNorm32,
     RMSNorm32,
     SwiGLUFFN,
@@ -451,6 +452,12 @@ class CaloLightningDiT(nn.Module):
     The patch grid size is:
         `(R / pR, PHI / pPHI, Z / pZ)`
     where `patch_size = (pR, pPHI, pZ)`.
+
+    Patch embedding selection:
+        - default: ``VolumeEmbedder`` with the existing ``use_conv`` switch.
+        - bottleneck: enable ``use_bottleneck_patch_embed`` and set
+          ``bottleneck_patch_embed_dim`` to use a JiT-style bottleneck
+          ``Conv3d(patch) -> Conv3d(1x1x1)`` embedder.
     """
     def __init__(
         self,
@@ -475,6 +482,8 @@ class CaloLightningDiT(nn.Module):
         proj_drop: float = 0.0,
         use_rmsnorm: bool = False,
         use_conv: bool = False,
+        use_bottleneck_patch_embed: bool = False,
+        bottleneck_patch_embed_dim: Optional[int] = None,
         condition_embed_dims: Optional[Sequence[int]] = None,
         final_layer_type: Literal["auto", "calodit2", "pixart", "classicdit", "gated", "final"] = "auto",
         **kwargs
@@ -498,19 +507,36 @@ class CaloLightningDiT(nn.Module):
         self.attn_drop = attn_drop
         self.proj_drop = proj_drop
         self.use_rmsnorm = use_rmsnorm
+        self.use_conv = use_conv
+        self.use_bottleneck_patch_embed = use_bottleneck_patch_embed
+        self.bottleneck_patch_embed_dim = bottleneck_patch_embed_dim
         self.dtype = str_to_dtype(dtype) if isinstance(dtype, str) else dtype
         self.final_layer_type = final_layer_type
 
-        # 2. 核心修改：先初始化 Patch Embedder
-        # 我们直接使用 VolumeEmbedder 来处理 grid_size 的计算逻辑
-        # 这样确保 RoPE 的网格和实际 Patch 的网格 100% 对齐
-        self.patch_embedder = VolumeEmbedder(
-            input_size=self.input_size,
-            patch_size=self.patch_size,
-            in_channels=self.in_channels,
-            out_channels=self.model_channels,
-            use_conv=use_conv
-        )
+        # 2. 先初始化 patch embedder，确保后续位置编码与真实 patch 网格对齐。
+        if self.use_bottleneck_patch_embed:
+            if self.bottleneck_patch_embed_dim is None:
+                raise ValueError(
+                    "bottleneck_patch_embed_dim must be set when "
+                    "use_bottleneck_patch_embed=True."
+                )
+            self.patch_embedder_type = "bottleneck"
+            self.patch_embedder = BottleneckVolumeEmbedder(
+                input_size=self.input_size,
+                patch_size=self.patch_size,
+                in_channels=self.in_channels,
+                bottleneck_channels=self.bottleneck_patch_embed_dim,
+                out_channels=self.model_channels,
+            )
+        else:
+            self.patch_embedder_type = "conv" if self.use_conv else "linear"
+            self.patch_embedder = VolumeEmbedder(
+                input_size=self.input_size,
+                patch_size=self.patch_size,
+                in_channels=self.in_channels,
+                out_channels=self.model_channels,
+                use_conv=self.use_conv,
+            )
         
         # 3. 获取正确的 grid_size (D, H, W)
         self.grid_size = self.patch_embedder.grid_size
@@ -721,10 +747,19 @@ class CaloLightningDiT(nn.Module):
                         nn.init.constant_(module.bias, 0)
             self.apply(_basic_init)
 
-            # Initialize patch embedder like nn.Linear (instead of nn.Conv2d):
-            w = self.patch_embedder.proj.weight.data
-            nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-            nn.init.constant_(self.patch_embedder.proj.bias, 0)
+            # Initialize either a single-stage patch embedder or a bottleneck one.
+            if hasattr(self.patch_embedder, "proj"):
+                w = self.patch_embedder.proj.weight.data
+                nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+                if self.patch_embedder.proj.bias is not None:
+                    nn.init.constant_(self.patch_embedder.proj.bias, 0)
+            else:
+                w1 = self.patch_embedder.proj1.weight.data
+                nn.init.xavier_uniform_(w1.view([w1.shape[0], -1]))
+                w2 = self.patch_embedder.proj2.weight.data
+                nn.init.xavier_uniform_(w2.view([w2.shape[0], -1]))
+                if self.patch_embedder.proj2.bias is not None:
+                    nn.init.constant_(self.patch_embedder.proj2.bias, 0)
 
             # Initialize timestep embedding MLP:
             nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)

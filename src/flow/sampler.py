@@ -82,3 +82,39 @@ def midpoint_ode_sample(model, x, conditions, steps=50, progress=False):
         x = x + v_mid * dt
 
     return x
+
+
+@torch.no_grad()
+def rk4_ode_sample(model, x, conditions, steps=50, progress=False):
+    """Classical 4th-order Runge-Kutta ODE solver for flow matching.
+
+    x_next = x + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+    where:
+        k1 = v(x, t)
+        k2 = v(x + 0.5*dt*k1, t + 0.5*dt)
+        k3 = v(x + 0.5*dt*k2, t + 0.5*dt)
+        k4 = v(x + dt*k3, t + dt)
+    """
+    dt = 1.0 / steps
+    for i in trange(steps, disable=not progress):
+        t_cur = i * dt
+        t_mid = t_cur + 0.5 * dt
+        t_next = (i + 1) * dt
+
+        t_cur_batch = torch.full((x.shape[0],), t_cur, device=x.device, dtype=x.dtype)
+        k1 = model(x, conditions, t_cur_batch)
+
+        x_k2 = x + 0.5 * dt * k1
+        t_mid_batch = torch.full((x.shape[0],), t_mid, device=x.device, dtype=x.dtype)
+        k2 = model(x_k2, conditions, t_mid_batch)
+
+        x_k3 = x + 0.5 * dt * k2
+        k3 = model(x_k3, conditions, t_mid_batch)
+
+        x_k4 = x + dt * k3
+        t_next_batch = torch.full((x.shape[0],), t_next, device=x.device, dtype=x.dtype)
+        k4 = model(x_k4, conditions, t_next_batch)
+
+        x = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+    return x

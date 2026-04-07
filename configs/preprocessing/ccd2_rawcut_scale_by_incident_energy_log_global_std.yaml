@@ -1,0 +1,14 @@
+# CCD2 preprocessing pipeline: raw cut -> x / E_inc -> log -> global standardize
+steps:
+    - class_name: src.data.preprocessing.CutNoise
+      init_args:
+          noise_level: 0.5e-6
+          both_directions: true
+    - class_name: src.data.preprocessing.ScaleByIncidentEnergy
+    - class_name: src.data.preprocessing.LogTransform
+      init_args:
+          eps: 1.0e-06
+    - class_name: src.data.preprocessing.Standarize
+      init_args:
+          mean: -13.4001251
+          std: 0.9906733

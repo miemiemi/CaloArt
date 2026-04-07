@@ -6,6 +6,7 @@ import mplhep as hep
 import numpy as np
 import plotly.graph_objs as go
 from matplotlib import pyplot as plt
+from matplotlib.ticker import AutoMinorLocator, MaxNLocator
 from scipy.optimize import curve_fit
 from scipy.stats import wasserstein_distance
 
@@ -57,6 +58,14 @@ def set_style():
 
 logger = get_logger()
 set_style()
+
+
+CELL_ENERGY_LINEAR_MIN = 1e-2
+CELL_ENERGY_LINEAR_MAX = 4000.0
+CELL_ENERGY_LINEAR_BINS = 1000
+CELL_ENERGY_LOG_BINS = 1000
+CELL_ENERGY_EFFECTIVE_RANGE_PERCENTILE = 99.5
+CELL_ENERGY_EFFECTIVE_RANGE_BINS = 1200
 
 
 @dataclass
@@ -560,6 +569,25 @@ class ShowerPlotter(Plotter):
     _full_simulation: Shower
     _ml_simulation: Shower
 
+    def _get_effective_cell_energy_upper_bound(
+        self,
+        full_simulation_cell_energy: np.ndarray,
+        ml_simulation_cell_energy: np.ndarray,
+    ) -> float:
+        """Estimate an upper x-limit for linear-energy plots that keeps the bulk visible."""
+        positive_reference = full_simulation_cell_energy[full_simulation_cell_energy > 0]
+        if positive_reference.size == 0:
+            positive_reference = ml_simulation_cell_energy[ml_simulation_cell_energy > 0]
+
+        if positive_reference.size == 0:
+            return CELL_ENERGY_LINEAR_MAX
+
+        upper_bound = float(np.percentile(positive_reference, CELL_ENERGY_EFFECTIVE_RANGE_PERCENTILE))
+        max_reference = float(np.max(positive_reference))
+        upper_bound = min(max_reference, upper_bound * 1.02)
+
+        return max(1.0, upper_bound)
+
     def _plot_total_energy_per_event(self, y_log_scale=True) -> dict:
         """Plots and saves a histogram with the distribution of total energy detected in an event.
 
@@ -655,7 +683,7 @@ class ShowerPlotter(Plotter):
 
         return {observable_name: {"plot_path": plot_path, "emd": emd}}
 
-    def _plot_cell_energy(self, log_energy=False, x_log_scale=False) -> dict:
+    def _plot_cell_energy(self, log_energy=False, x_log_scale=False, effective_range=False) -> dict:
         """Plots and saves a histogram with the distribution of number of detector's cells across whole
         calorimeter with particular energy detected.
 
@@ -686,12 +714,21 @@ class ShowerPlotter(Plotter):
             full_simulation_cell_energy = full_simulation_cell_energy[full_simulation_cell_energy != 0]
             ml_simulation_cell_energy = ml_simulation_cell_energy[ml_simulation_cell_energy != 0]
 
-            bins = np.linspace(-3, 4, 1000)
+            bins = np.linspace(-3, 4, CELL_ENERGY_LOG_BINS)
 
         else:
             observable_name = "CellEnergy"
             xlabel = "Energy [MeV]"
-            bins = np.linspace(1e-2, 4000, 1000)
+            upper_bound = CELL_ENERGY_LINEAR_MAX
+            if effective_range:
+                upper_bound = self._get_effective_cell_energy_upper_bound(
+                    full_simulation_cell_energy=full_simulation_cell_energy,
+                    ml_simulation_cell_energy=ml_simulation_cell_energy,
+                )
+                observable_name += "_effective_range"
+                bins = np.linspace(CELL_ENERGY_LINEAR_MIN, upper_bound, CELL_ENERGY_EFFECTIVE_RANGE_BINS)
+            else:
+                bins = np.linspace(CELL_ENERGY_LINEAR_MIN, CELL_ENERGY_LINEAR_MAX, CELL_ENERGY_LINEAR_BINS)
 
         fig, ax = plt.subplots(figsize=(12, 8))
         ax.hist(
@@ -715,6 +752,13 @@ class ShowerPlotter(Plotter):
         if x_log_scale:
             ax.set_xscale("log")
             observable_name += "_xlog"
+        elif not log_energy:
+            if effective_range:
+                ax.set_xlim(CELL_ENERGY_LINEAR_MIN, upper_bound)
+            ax.xaxis.set_major_locator(MaxNLocator(nbins=10))
+            ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+            ax.tick_params(axis="x", which="major", length=6)
+            ax.tick_params(axis="x", which="minor", length=3)
 
         ax.set_ylim(bottom=1)
         ax.set_yscale("log")
@@ -754,6 +798,11 @@ class ShowerPlotter(Plotter):
         logger.info("Plotting cell energy distribution...")
         cell_energy_results = self._plot_cell_energy()
         results.update(cell_energy_results)
+
+        logger.info("Plotting zoomed cell energy distribution in the effective range...")
+        cell_energy_zoom_results = self._plot_cell_energy(effective_range=True)
+        results.update(cell_energy_zoom_results)
+
         cell_energy_xlog_results = self._plot_cell_energy(x_log_scale=True)
         results.update(cell_energy_xlog_results)
 

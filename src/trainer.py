@@ -19,10 +19,11 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
-from src.data.dataset import CaloShowerDataset, DummyDataset
+from src.data.dataset import CaloShowerDataset, DummyDataset, preprocess_geo
 from src.data.preprocessing import CaloShowerPreprocessor, cut_below_noise_level
 from src.data.utils import save_showers
 from src.evaluation.utils import compare_observables
+from src.flow.reject_redraw import apply_reject_and_redraw, filter_model_sample_kwargs
 from src.method_base import MethodBase
 from src.models.ema import ema_update
 from src.utils import (
@@ -37,7 +38,6 @@ from src.utils import (
 )
 
 logger = get_logger()
-
 
 @dataclass
 class TrainingState:
@@ -288,6 +288,35 @@ class DiffusionTrainer(object):
     def device(self):
         return self.accelerator.device
 
+    def _build_sampling_conditions(self, incident_energy, phi, theta, geometry):
+        energy = torch.as_tensor(
+            np.asarray(incident_energy).reshape(-1),
+            device=self.accelerator.device,
+            dtype=torch.float32,
+        )
+        phi_tensor = torch.full_like(energy, float(phi))
+        theta_tensor = torch.full_like(energy, float(theta))
+        conditions = (energy, phi_tensor, theta_tensor)
+        if self.need_geo_condn:
+            if self.train_on is None:
+                raise ValueError("`train_on` must be set when `need_geo_condn=True`.")
+            geo = preprocess_geo(len(energy), geometry, self.train_on)
+            conditions = conditions + (
+                torch.as_tensor(geo, device=self.accelerator.device, dtype=torch.float32),
+            )
+        return conditions
+
+    def _sample_replacements(self, model, incident_energy, phi, theta, geometry):
+        raw_conditions = self._build_sampling_conditions(incident_energy, phi, theta, geometry)
+        _, transformed_conditions = self.preprocessor.transform(conditions=raw_conditions)
+        generated_events = unwrap_ddp(model).sample(
+            conditions=transformed_conditions,
+            progress=False,
+            **filter_model_sample_kwargs(self.sampling_args),
+        ).squeeze(1)
+        generated_events, _ = self.preprocessor.inverse_transform(generated_events, transformed_conditions)
+        return generated_events.cpu().numpy()
+
     def _setup_logging(self):
         if self.accelerator.is_main_process:
             if self.use_wandb:
@@ -502,10 +531,13 @@ class DiffusionTrainer(object):
             
         save_generated = bool(self.save_generated or self.fpd_config.get("save_generated", False))
         compute_kpd = bool(self.fpd_config.get("compute_kpd", False))
+        # Split test-control flags from the kwargs that the metric function
+        # actually accepts. Otherwise keys like `num_showers`/`save_generated`
+        # or a duplicate `compute_kpd` can crash post-processing.
         metric_fpd_config = {
             key: value
             for key, value in self.fpd_config.items()
-            if key not in {"num_showers", "save_generated", "compute_kpd"}
+            if key in {"particle", "xml_filename", "cut", "min_samples", "batch_size"}
         }
 
         for geometry, energy, phi, theta, fullsim_path in self.test_conditions:
@@ -566,6 +598,7 @@ class DiffusionTrainer(object):
             )
 
             generated_events_list = []
+            need_original_events = self.enable_plots or self.enable_fpd
             orginal_events_list = []
             incident_energy_list = []
             for sample in tqdm(
@@ -580,18 +613,27 @@ class DiffusionTrainer(object):
                 generated_events = unwrap_ddp(model).sample(
                     conditions=conditions,
                     progress=False,
-                    **self.sampling_args,
+                    **filter_model_sample_kwargs(self.sampling_args),
                 ).squeeze(1)
                 generated_events, _ = self.preprocessor.inverse_transform(generated_events, conditions)
-                gathered_original_events, gathered_generated_events, gathered_incident_energy = self.accelerator.gather_for_metrics(
-                    (
-                        showers.squeeze(1).contiguous(),
-                        generated_events.contiguous(),
-                        incident_energy.contiguous(),
+                if need_original_events:
+                    gathered_original_events, gathered_generated_events, gathered_incident_energy = self.accelerator.gather_for_metrics(
+                        (
+                            showers.squeeze(1).contiguous(),
+                            generated_events.contiguous(),
+                            incident_energy.contiguous(),
+                        )
                     )
-                )
+                else:
+                    gathered_generated_events, gathered_incident_energy = self.accelerator.gather_for_metrics(
+                        (
+                            generated_events.contiguous(),
+                            incident_energy.contiguous(),
+                        )
+                    )
                 if self.accelerator.is_main_process:
-                    orginal_events_list.append(gathered_original_events.cpu().numpy())
+                    if need_original_events:
+                        orginal_events_list.append(gathered_original_events.cpu().numpy())
                     generated_events_list.append(gathered_generated_events.cpu().numpy())
                     incident_energy_list.append(gathered_incident_energy.cpu().numpy().reshape(-1, 1))
 
@@ -599,13 +641,41 @@ class DiffusionTrainer(object):
             generated_events = None
             incident_energy = None
             if self.accelerator.is_main_process:
-                original_events = np.concatenate(orginal_events_list)
+                if need_original_events:
+                    original_events = np.concatenate(orginal_events_list)
                 generated_events = np.concatenate(generated_events_list)
                 incident_energy = np.concatenate(incident_energy_list)
+                (
+                    generated_events,
+                    original_events,
+                    incident_energy,
+                    redraw_summary,
+                ) = apply_reject_and_redraw(
+                    generated_events,
+                    incident_energy,
+                    geometry=geometry,
+                    sampling_args=self.sampling_args,
+                    original_events=original_events,
+                    sample_fn=lambda batch_incident_energy: self._sample_replacements(
+                        model,
+                        batch_incident_energy,
+                        phi,
+                        theta,
+                        geometry,
+                    ),
+                )
+            else:
+                redraw_summary = None
 
             if needs_main_postprocess:
                 if self.accelerator.is_main_process:
                     try:
+                        if redraw_summary is not None:
+                            OmegaConf.save(
+                                OmegaConf.create(redraw_summary),
+                                output_dir / "reject_redraw_summary.yaml",
+                            )
+
                         if self.enable_plots:           # still 1000 for keep with calodit2
                             plot_original_events = original_events
                             plot_generated_events = generated_events

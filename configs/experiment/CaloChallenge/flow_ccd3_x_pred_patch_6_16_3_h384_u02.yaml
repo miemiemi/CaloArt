@@ -32,6 +32,13 @@ accelerator:
 model:
   model_path: null
 
+sampling:
+  steps: 32
+  solver: heun
+  reject_redraw: true
+  reject_redraw_max_ratio: 2.8
+  reject_redraw_reject_nonfinite: true
+
 train:
   learning_rate: 0.0005
   global_batch_size: 256

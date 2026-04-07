@@ -149,6 +149,34 @@ def verify_energy_only_consistency():
         )
 
 
+def verify_log10_roundtrip():
+    current = ConditionsPreprocessor(
+        keep_condition_components=("energy",),
+        energy_encoding="log10",
+        energy_min=1.0,
+        energy_max=1000.0,
+    )
+
+    for batch_size in (1, 4, 17):
+        raw_3, _ = make_raw_conditions(batch_size)
+        transformed_current = current.transform(raw_3)
+        inverted_current = current.inverse_transform(transformed_current)
+
+        expected = torch.log10(raw_3[0].reshape(-1, 1)) / torch.log10(torch.tensor(1000.0))
+        torch.testing.assert_close(
+            transformed_current[0],
+            expected,
+            atol=1e-6,
+            rtol=1e-6,
+        )
+        torch.testing.assert_close(
+            inverted_current[0],
+            raw_3[0].reshape(-1, 1),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Verify ConditionsPreprocessor math against the legacy behavior.")
     parser.add_argument("--verbose", action="store_true", help="Print extra progress information.")
@@ -162,7 +190,14 @@ def main():
         print("Checking energy-only selection against legacy energy branch...")
     verify_energy_only_consistency()
 
-    print("[OK] ConditionsPreprocessor matches legacy math for default behavior and energy-only selection.")
+    if args.verbose:
+        print("Checking explicit log10 energy encoding round-trip...")
+    verify_log10_roundtrip()
+
+    print(
+        "[OK] ConditionsPreprocessor matches legacy math for default behavior, "
+        "and explicit log10 energy encoding round-trips correctly."
+    )
 
 
 if __name__ == "__main__":

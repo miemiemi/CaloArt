@@ -1,0 +1,37 @@
+# CCD3 preprocessing aligned to OzAmram/CaloDiffusion `config_dataset3.json`.
+#
+# Key alignment details:
+# - CaloFlow loads CCD showers in internal GeV with the 0.033 sampling fraction
+#   already applied.
+# - CaloDiffusion dataset3 uses raw GeV voxels (no sampling-fraction correction),
+#   then divides by `MAXDEP * Einc` with `MAXDEP=2`, applies logit(eps=1e-6),
+#   and standardizes with the published dataset3 statistics.
+# - We therefore first undo the internal 0.033 factor so the transformed voxels
+#   match the CaloDiffusion convention exactly.
+#
+# The inverse path still applies the usual CCD readout cut at 5e-7 GeV internal
+# (~0.01515 MeV in evaluator space), matching the repo's existing CCD3 handling.
+steps:
+  - class_name: src.data.preprocessing.CutNoise
+    init_args:
+      noise_level: 5.0e-07
+      both_directions: false
+  - class_name: src.data.preprocessing.RemoveSamplingFraction
+    init_args:
+      factor: 30.303030303030305
+      reverse: true
+  - class_name: src.data.preprocessing.ScaleByIncidentEnergy
+  - class_name: src.data.preprocessing.ScaleByFactor
+    init_args:
+      factor: 2.0
+  - class_name: src.data.preprocessing.LogitTransform
+    init_args:
+      eps: 1.0e-06
+  - class_name: src.data.preprocessing.Standarize
+    init_args:
+      mean: -13.4804057
+      std: 1.1076759
+condition_preprocessing:
+  energy_encoding: log10
+  energy_min: 1.0
+  energy_max: 1000.0

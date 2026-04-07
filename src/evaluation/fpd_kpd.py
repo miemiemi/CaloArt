@@ -5,14 +5,18 @@ from pathlib import Path
 
 import numpy as np
 
+from src.data.shower_conventions import (
+    CCD_SAMPLING_FRACTION,
+    compute_event_energy_ratio,
+    convert_to_evaluator_energy_space,
+    get_sampling_fraction,
+)
 from src.evaluation.hlf.HighLevelFeatures import HighLevelFeatures
 
 logger = logging.getLogger(__name__)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CCD_SAMPLING_FRACTION = 0.033
-
 GEOMETRY_TO_PARTICLE = {
     "CCD2": "electron",
     "CCD3": "electron",
@@ -26,16 +30,6 @@ GEOMETRY_TO_XML = {
     "1-photons": REPO_ROOT / "cc_metrics" / "binning_dataset_1_photons.xml",
     "1-pions": REPO_ROOT / "cc_metrics" / "binning_dataset_1_pions.xml",
 }
-
-
-def _get_sampling_fraction(geometry):
-    if geometry is None:
-        return 1.0
-    if geometry.startswith("CCD"):
-        return CCD_SAMPLING_FRACTION
-    return 1.0
-
-
 def convert_to_fpd_evaluation_space(showers, incident_energy, geometry=None):
     """Convert CaloFlow internal showers to the evaluator convention.
 
@@ -44,12 +38,7 @@ def convert_to_fpd_evaluation_space(showers, incident_energy, geometry=None):
     showers in MeV and in the raw CCD voxel convention, so CCD inputs must also
     be divided by the sampling fraction.
     """
-    showers = np.asarray(showers, dtype=np.float32)
-    incident_energy = np.asarray(incident_energy, dtype=np.float32)
-
-    shower_scale = 1000.0 / _get_sampling_fraction(geometry)
-    energy_scale = 1000.0
-    return showers * shower_scale, incident_energy * energy_scale
+    return convert_to_evaluator_energy_space(showers, incident_energy, geometry=geometry)
 
 
 def prepare_fpd_inputs(showers, incident_energy, geometry=None):
@@ -65,7 +54,7 @@ def prepare_fpd_inputs(showers, incident_energy, geometry=None):
 
 def get_evaluator_threshold_from_internal_noise(noise_level, geometry=None):
     """Map the internal GeV noise threshold to the evaluator shower convention."""
-    return float(noise_level) * 1000.0 / _get_sampling_fraction(geometry)
+    return float(noise_level) * 1000.0 / get_sampling_fraction(geometry)
 
 
 def prepare_high_data_for_classifier(voxel_orig, E_inc_orig, hlf_class, label, cut=0.0):

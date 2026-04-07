@@ -19,8 +19,10 @@ logs/archive/*
 !logs/archive/.gitkeep
 outputs/
 experiments/
+tmp_experiments/
 generations/
 wandb/
+.codex/
 
 # Job and training logs
 *.log
@@ -41,3 +43,6 @@ scripts/slurm/local/*
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Local test directories
+tests/

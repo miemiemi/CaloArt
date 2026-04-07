@@ -24,14 +24,19 @@ OUTPUT_DIR="${OUTPUT_DIR:-./experiments}"
 NUM_PROCESSES="${NUM_PROCESSES:-2}"
 USE_WANDB="${USE_WANDB:-true}"
 ARCH_CONFIG="${ARCH_CONFIG:-}"
+CONFIG_NAME="${CONFIG_NAME:-experiment/CaloChallenge/flow_logit_normal}"
+MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-$((20000 + SLURM_JOB_ID % 20000))}"
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 
 CMD=(
   accelerate
   launch
+  --multi_gpu
   --num_processes="${NUM_PROCESSES}"
+  --main_process_port="${MAIN_PROCESS_PORT}"
   scripts/train.py
   --config-name
-  experiment/CaloChallenge/flow_logit_normal
+  "${CONFIG_NAME}"
   experiment.use_wandb="${USE_WANDB}"
   experiment.output_dir="${OUTPUT_DIR}"
   experiment.run_name="${RUN_NAME}"
@@ -39,6 +44,10 @@ CMD=(
 
 if [[ -n "${ARCH_CONFIG}" ]]; then
   CMD+=("model@model.architecture=${ARCH_CONFIG}")
+fi
+
+if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
+  CMD+=("+train.resume_from_checkpoint=${RESUME_FROM_CHECKPOINT}")
 fi
 
 printf 'Launching:'

@@ -23,6 +23,10 @@ RUN_NAME="${RUN_NAME:-flow_ccd2_patch345_mid_t108_smoke}"
 OUTPUT_DIR="${OUTPUT_DIR:-./tmp_experiments}"
 MAX_STEPS="${MAX_STEPS:-2}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-4}"
+CONFIG_NAME="${CONFIG_NAME:-experiment/CaloChallenge/flow_ccd2_pred_v_all_lightingdit_freatures_patch_3_4_5_mid_latest}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
+
+read -r -a EXTRA_ARGS_ARR <<< "${EXTRA_ARGS}"
 
 accelerate launch \
   --num_machines=1 \
@@ -30,7 +34,7 @@ accelerate launch \
   --mixed_precision=no \
   --dynamo_backend=no \
   scripts/train.py \
-  --config-name experiment/CaloChallenge/flow_ccd2_pred_v_all_lightingdit_freatures_patch_3_4_5_mid_latest \
+  --config-name "${CONFIG_NAME}" \
   experiment.use_wandb=false \
   experiment.output_dir="${OUTPUT_DIR}" \
   experiment.run_name="${RUN_NAME}" \
@@ -41,4 +45,5 @@ accelerate launch \
   train.valid_strategy=no \
   train.test_strategy=no \
   train.load_best_model_at_end=false \
-  accelerator.mixed_precision=no
+  accelerator.mixed_precision=no \
+  "${EXTRA_ARGS_ARR[@]}"

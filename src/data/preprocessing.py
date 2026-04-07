@@ -1,3 +1,5 @@
+import math
+
 import torch
 import numpy as np
 
@@ -28,7 +30,7 @@ class CutNoise:
 
 
 class AddNoise:
-    """Adds uniform noise to the input."""
+    """Adds one-sided uniform noise during preprocessing only."""
 
     def __init__(self, noise_level):
         self.noise_level = noise_level
@@ -37,7 +39,27 @@ class AddNoise:
         return x + torch.rand_like(x) * self.noise_level
 
     def inverse_transform(self, x, _energy):
-        return cut_below_noise_level(x, self.noise_level)
+        # Final thresholding should be handled explicitly by CutNoise.
+        return x
+
+
+class ScaleAboveCut:
+    """Amplifies voxels above a threshold during preprocessing and undoes it on inverse."""
+
+    def __init__(self, factor, threshold):
+        if factor <= 0:
+            raise ValueError(f"factor must be positive, got {factor}.")
+        if threshold < 0:
+            raise ValueError(f"threshold must be non-negative, got {threshold}.")
+        self.factor = factor
+        self.threshold = threshold
+        self.scaled_threshold = threshold * factor
+
+    def transform(self, x, _energy):
+        return torch.where(x > self.threshold, x * self.factor, x)
+
+    def inverse_transform(self, x, _energy):
+        return torch.where(x > self.scaled_threshold, x / self.factor, x)
 
 
 class LogitTransform:
@@ -64,6 +86,36 @@ class LogTransform:
         return torch.exp(x) - self.eps
 
 
+class Log1pTransform:
+    """Applies log(1 + x / scale) with a stable inverse."""
+
+    def __init__(self, scale):
+        if scale <= 0:
+            raise ValueError(f"scale must be positive, got {scale}.")
+        self.scale = scale
+
+    def transform(self, x, _energy):
+        return torch.log1p(x / self.scale)
+
+    def inverse_transform(self, x, _energy):
+        return torch.expm1(x) * self.scale
+
+
+class AsinhTransform:
+    """Applies asinh(x / scale) with a stable inverse."""
+
+    def __init__(self, scale):
+        if scale <= 0:
+            raise ValueError(f"scale must be positive, got {scale}.")
+        self.scale = scale
+
+    def transform(self, x, _energy):
+        return torch.asinh(x / self.scale)
+
+    def inverse_transform(self, x, _energy):
+        return torch.sinh(x) * self.scale
+
+
 class Standarize:
     def __init__(self, mean, std):
         self.mean = mean
@@ -74,6 +126,20 @@ class Standarize:
 
     def inverse_transform(self, x, _energy):
         return (x * self.std) + self.mean
+
+
+class StandarizeHalf:
+    """Standardize to half-scale outputs while keeping inverse self-consistent."""
+
+    def __init__(self, mean, std):
+        self.mean = mean
+        self.std = std
+
+    def transform(self, x, _energy):
+        return (x - self.mean) / self.std * 0.5
+
+    def inverse_transform(self, x, _energy):
+        return (x * self.std * 2) + self.mean
 
 
 class ScaleByIncidentEnergy:
@@ -170,7 +236,13 @@ class ShowerPreprocessor:
 
 
 class ConditionsPreprocessor:
-    def __init__(self, keep_condition_components=None):
+    def __init__(
+        self,
+        keep_condition_components=None,
+        energy_encoding="linear",
+        energy_min=1.0,
+        energy_max=1000.0,
+    ):
         self.keep_condition_components = None
         if keep_condition_components is not None:
             self.keep_condition_components = tuple(keep_condition_components)
@@ -178,18 +250,39 @@ class ConditionsPreprocessor:
             invalid_components = set(self.keep_condition_components) - valid_components
             if invalid_components:
                 raise ValueError(f"Unsupported condition components: {sorted(invalid_components)}")
+        valid_energy_encodings = {"linear", "log10"}
+        if energy_encoding not in valid_energy_encodings:
+            raise ValueError(
+                f"Unsupported energy_encoding '{energy_encoding}'. "
+                f"Expected one of {sorted(valid_energy_encodings)}."
+            )
+        if energy_min <= 0:
+            raise ValueError(f"energy_min must be positive, got {energy_min}.")
+        if energy_max <= energy_min:
+            raise ValueError(
+                f"energy_max must be larger than energy_min, got energy_min={energy_min}, energy_max={energy_max}."
+            )
+        self.energy_encoding = energy_encoding
+        self.energy_min = float(energy_min)
+        self.energy_max = float(energy_max)
 
     def _transform_energy(self, energy):
-        energy_min = 1  # after division by 1000
-        energy_max = 1000  # after division by 1000
-        # return torch.log10(energy / energy_min) / torch.log10(energy_max / energy_min)
-        return energy / energy_max
+        if self.energy_encoding == "linear":
+            return energy / self.energy_max
+
+        encoded = torch.log10(energy.clamp_min(self.energy_min) / self.energy_min)
+        return encoded / math.log10(self.energy_max / self.energy_min)
 
     def _inverse_transform_energy(self, energy):
-        energy_min = 1  # after division by 1000
-        energy_max = 1000  # after division by 1000
-        # return energy_min * (energy_max / energy_min) ** energy
-        return energy * energy_max
+        if self.energy_encoding == "linear":
+            return energy * self.energy_max
+
+        base = torch.as_tensor(
+            self.energy_max / self.energy_min,
+            dtype=energy.dtype,
+            device=energy.device,
+        )
+        return self.energy_min * torch.pow(base, energy)
 
     # [0.0, 3.14] -> [0, 1]
     def _transform_theta(self, theta):
@@ -282,9 +375,13 @@ class ConditionsPreprocessor:
 
 
 class CaloShowerPreprocessor:
-    def __init__(self, steps, keep_condition_components=None):
+    def __init__(self, steps, keep_condition_components=None, condition_preprocessing=None):
         self.shower_preprocessor = ShowerPreprocessor(steps)
-        self.conditions_preprocessor = ConditionsPreprocessor(keep_condition_components=keep_condition_components)
+        condition_preprocessing = condition_preprocessing or {}
+        self.conditions_preprocessor = ConditionsPreprocessor(
+            keep_condition_components=keep_condition_components,
+            **condition_preprocessing,
+        )
 
     def transform(self, showers=None, conditions=None):
         if showers is not None and conditions is not None:
