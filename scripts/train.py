@@ -19,7 +19,11 @@ import hydra
 
 
 
-@hydra.main(version_base="1.3", config_path="../configs", config_name="experiment/CaloChallenge/flow_uniform")
+@hydra.main(
+    version_base="1.3",
+    config_path="../configs",
+    config_name="experiment/CaloArt_paper/flow_ccd2_pred_v_loss_v_logit_normal_cond_energy_log10_h384_l6_nh6_patch_3_4_3_pixart_fpd100k",
+)
 def main(cfg: DictConfig):
     # accelerator
     accelerator = setup_accelerator(**cfg.accelerator)

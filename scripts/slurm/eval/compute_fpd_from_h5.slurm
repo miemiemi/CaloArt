@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-REPO_DIR="/aifs/user/home/huangzhengkun/work/repositories/CaloFlow"
+REPO_DIR="${REPO_DIR:-/aifs/user/home/huangzhengkun/work/repositories/CaloFlow}"
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate CaloFlow

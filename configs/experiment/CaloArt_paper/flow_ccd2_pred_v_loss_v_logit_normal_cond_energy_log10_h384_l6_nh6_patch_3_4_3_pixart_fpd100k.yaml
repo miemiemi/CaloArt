@@ -24,7 +24,7 @@ experiment:
   run_name: flow_ccd2_pred_v_loss_v_logit_normal_cond_energy_log10_h384_l6_nh6_patch_3_4_3_pixart_fpd100k
   output_dir: ./experiments
   seed: 42
-  use_wandb: true
+  use_wandb: false
 
 accelerator:
   cpu: false
@@ -68,7 +68,7 @@ train:
   test_steps: 49999
   test_num_showers: 100000
   test_conditions:
-    - ['CCD2', -1, 0.0, 1.57, '/aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets/dataset_2_2.hdf5']
+    - ['CCD2', -1, 0.0, 1.57, '${oc.env:CALOCHALLENGE_DATA_DIR,/aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets}/dataset_2_2.hdf5']
   enable_plots: true
   enable_fpd: true
   save_generated: true
