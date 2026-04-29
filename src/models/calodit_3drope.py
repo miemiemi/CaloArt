@@ -489,7 +489,7 @@ class CaloLightningDiT(nn.Module):
         **kwargs
     ):
         super().__init__()
-        # 1. 基础参数保存
+        # 1. Save basic parameters.
         self.input_size = tuple(input_size)
         self.patch_size = tuple(patch_size)
         self.conditions_size = conditions_size
@@ -513,7 +513,8 @@ class CaloLightningDiT(nn.Module):
         self.dtype = str_to_dtype(dtype) if isinstance(dtype, str) else dtype
         self.final_layer_type = final_layer_type
 
-        # 2. 先初始化 patch embedder，确保后续位置编码与真实 patch 网格对齐。
+        # 2. Initialize the patch embedder first so positional embeddings match
+        # the actual patch grid.
         if self.use_bottleneck_patch_embed:
             if self.bottleneck_patch_embed_dim is None:
                 raise ValueError(
@@ -538,19 +539,20 @@ class CaloLightningDiT(nn.Module):
                 use_conv=self.use_conv,
             )
         
-        # 3. 获取正确的 grid_size (D, H, W)
+        # 3. Get the resolved grid_size (D, H, W).
         self.grid_size = self.patch_embedder.grid_size
         self.num_patches = self.patch_embedder.num_patches
 
         # ----------------------------------------------------------------
-        # 4. 位置编码逻辑 (Position Embedding)
-        # 支持三种模式："ape" / "rope" / "ape+rope"
-        # 参考 JiT (Lightning-DiT)：APE 加到 token, RoPE 旋转 Q/K，两者可共存
+        # 4. Positional embedding logic.
+        # Supports three modes: "ape", "rope", and "ape+rope".
+        # Following JiT / Lightning-DiT, APE is added to tokens while RoPE
+        # rotates Q/K; the two can be used together.
         # ----------------------------------------------------------------
         self._use_ape = pe_mode in ("ape", "ape+rope")
         self._use_rope = pe_mode in ("rope", "ape+rope")
 
-        # 生成 3D 网格坐标 (APE / RoPE 都需要)
+        # Generate 3D grid coordinates used by both APE and RoPE.
         coords = torch.meshgrid(
             *[torch.arange(s) for s in self.grid_size],
             indexing='ij'
@@ -567,7 +569,7 @@ class CaloLightningDiT(nn.Module):
             self.pos_emb = None
 
         if self._use_rope:
-            # Rotary Position Embedding — 预计算相位/频率表
+            # Rotary position embedding: precompute the phase/frequency table.
             rope_embedder = RotaryPositionEmbedder(self.model_channels // self.num_heads, 3)
             rope_phases = rope_embedder(coords)
             self.register_buffer("rope_phases", rope_phases)
@@ -575,7 +577,7 @@ class CaloLightningDiT(nn.Module):
             self.rope_phases = None
 
         # ----------------------------------------------------------------
-        # 5. 其他组件初始化
+        # 5. Initialize the remaining components.
         # ----------------------------------------------------------------
         self.t_embedder = TimestepEmbedder(model_channels)
         self.num_condition_components = len(self.conditions_size)
@@ -609,7 +611,7 @@ class CaloLightningDiT(nn.Module):
         else:
             self.label_embedder = None
 
-        # 共享调制层 (如果启用)
+        # Shared modulation layer, if enabled.
         if share_mod:
             self.adaLN_modulation = nn.Sequential(
                 nn.SiLU(),
@@ -625,7 +627,7 @@ class CaloLightningDiT(nn.Module):
                 attn_mode='full',
                 use_checkpoint=self.use_checkpoint,
                 use_rope=self._use_rope,
-                rope_freq=rope_freq, # Block 内部通常不需要 freq，只需要 rope_phases，视具体实现而定
+                rope_freq=rope_freq, # Blocks usually use rope_phases rather than freq directly.
                 share_mod=share_mod,
                 qk_rms_norm=self.qk_rms_norm,
                 attn_drop=self.attn_drop,
@@ -635,10 +637,11 @@ class CaloLightningDiT(nn.Module):
             for _ in range(num_blocks)
         ])
 
-        # 6. 输出层与 Unpatchify
-        # FinalLayer 的输出必须匹配 Unpatchify 的输入要求 (Patch体积 * C_out)。
-        # 是否使用 CaloDit2FinalLayer 与是否启用 APE 解耦；只有在真正选择
-        # CaloDit2FinalLayer 时，才要求提供 absolute positional embeddings。
+        # 6. Output layer and unpatchify.
+        # FinalLayer output must match the unpatchify input shape
+        # (patch volume * C_out).
+        # The CaloDit2FinalLayer choice is decoupled from APE usage; absolute
+        # positional embeddings are required only when that layer is selected.
         final_layer_aliases = {
             "auto": "auto",
             "calodit2": "calodit2",
@@ -715,7 +718,7 @@ class CaloLightningDiT(nn.Module):
             self.final_layer_uses_pos_emb = False
         
         self.unpatchify = VolumeUnembedder(
-            output_size=self.input_size, # 还原回原始尺寸
+            output_size=self.input_size, # Restore the original spatial size.
             patch_size=self.patch_size,
             out_channels=out_channels
         )
@@ -798,8 +801,9 @@ class CaloLightningDiT(nn.Module):
                 nn.init.constant_(self.final_layer.adaLN_modulation_pos[-1].weight, 0)
                 nn.init.constant_(self.final_layer.adaLN_modulation_pos[-1].bias, 0)
 
-            # C. Final Layer (关键：Zero-Init)
-            # 1. Zero-out 线性投影层，使得初始输出为 0 (类似高斯噪声的均值)
+            # C. Final layer: zero initialization.
+            # Zero out the linear projection so the initial output is 0, similar
+            # to the mean of Gaussian noise.
             nn.init.constant_(self.final_layer.linear.weight, 0)
             nn.init.constant_(self.final_layer.linear.bias, 0)
 
@@ -891,43 +895,47 @@ class CaloLightningDiT(nn.Module):
                tuple of conditioning tensors
             t: (N,) tensor of diffusion timesteps
             """
-            # 1. 计算基础 Embeddings
+            # 1. Compute base embeddings.
             t_emb = self.t_embedder(t) # Shape: (N, D)
 
-            # 条件元组使用独立的 embedder 编码，并沿特征维做等宽拼接
+            # Encode each condition component with its own embedder and
+            # concatenate them along the feature dimension.
             c_cond = self._embed_conditions(c)
 
-            # 2. 生成全局原始条件向量 (Global Conditioning Vector)
-            # 条件之间不再相加，而是先 concat，再与 timestep embedding 融合
+            # 2. Build the global conditioning vector.
+            # Condition components are concatenated first, then fused with the
+            # timestep embedding.
             c_global = t_emb + c_cond
 
-            # 3. 准备骨干网络专用条件 (Backbone Conditioning)
+            # 3. Prepare backbone-specific conditioning.
             if self.share_mod:
-                # 如果启用共享调制，在此处统一投影到 6*D (或者 Block 需要的维度)
+                # With shared modulation, project once to 6*D or to the
+                # dimensionality expected by the block.
                 c_backbone = self.adaLN_modulation(c_global)
             else:
-                # 如果独立调制，保持原始维度 D，交给 Block 内部的 MLP 处理
+                # With per-block modulation, keep the original D-dimensional
+                # vector and let each block MLP process it.
                 c_backbone = c_global
 
             # 4. Patchify (Image -> Tokens)
             x = self.patch_embedder(x)
 
-            # 5. 位置编码处理
-            # APE：直接加到 token embedding 上
+            # 5. Positional embedding handling.
+            # APE is added directly to token embeddings.
             if self._use_ape:
                 x = x + self.pos_emb
 
-            # RoPE：准备相位信息传给 Attention（Q/K 旋转）
+            # RoPE passes phase information to attention for Q/K rotation.
             rope = self.rope_phases if self._use_rope else None
 
-            # 6. Transformer Blocks 循环
-            # 关键点：这里传入 c_backbone
+            # 6. Transformer block loop.
+            # Pass c_backbone into each block.
             for block in self.blocks:
                 x = block(x, c_backbone, phases=rope)
 
             # 7. Final Layer
-            # 关键点：这里传入原始的 c_global (维度 D)
-            # 因为 FinalLayer 定义了自己的映射层 (adaLN_modulation_condn)，它期望输入维度为 model_channels
+            # Pass the original D-dimensional c_global here because FinalLayer
+            # defines its own mapping layer and expects model_channels inputs.
             if self.final_layer_uses_pos_emb:
                 x = self.final_layer(x, c_global, self.pos_emb)
             else:

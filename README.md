@@ -1,6 +1,14 @@
 # CaloArt CCD2 Flow
 
+[![hydra](https://img.shields.io/badge/Config-Hydra_1.3-89b8cd)](https://hydra.cc/)
+
 Minimal public code branch for the CaloArt CCD2 PixArt flow-matching model.
+
+> **Note**
+> This repository is a minimal public branch for reproducing the paper
+> experiments. We will continue improving the readability and reusability of
+> the code, and a more complete release will be made available in a future
+> update.
 
 This branch keeps the source code and the single paper configuration needed to
 train and evaluate:
