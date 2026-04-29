@@ -1,0 +1,14 @@
+# Re-binned CCD3 preprocessing pipeline for energy-only conditioning.
+# Statistics recomputed from dataset_3_1_2_rebinned_45x25x9.hdf5.
+steps:
+  - class_name: src.data.preprocessing.CutNoise
+    init_args:
+      noise_level: 5.0e-07
+      both_directions: true
+  - class_name: src.data.preprocessing.LogTransform
+    init_args:
+      eps: 1.0e-06
+  - class_name: src.data.preprocessing.Standarize
+    init_args:
+      mean: -12.5620596
+      std: 2.5960090

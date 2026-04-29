@@ -4,6 +4,8 @@ from pathlib import Path
 import torch
 from omegaconf import OmegaConf
 
+from src.config_utils import sanitize_config_for_artifact
+
 def main():
     parser = argparse.ArgumentParser(description="Export an Accelerate checkpoint to a single .pt file.")
     parser.add_argument("--checkpoint_dir", type=str, required=True, help="Path to the accelerate checkpoint directory")
@@ -18,7 +20,7 @@ def main():
     if not config_path.exists():
         raise FileNotFoundError(f"config.yaml not found in {checkpoint_dir}")
         
-    config = OmegaConf.load(config_path)
+    config = sanitize_config_for_artifact(OmegaConf.load(config_path))
 
     # Accelerate saves main model in pytorch_model.bin and ema model in pytorch_model_1.bin 
     model_bin = "pytorch_model_1.bin" if args.use_ema else "pytorch_model.bin"

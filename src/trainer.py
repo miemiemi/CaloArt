@@ -1,11 +1,12 @@
 import copy
+import inspect
 import math
 import os
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -45,6 +46,7 @@ class TrainingState:
     step: int = 0
     elapsed_time: float = 0.0
     best_valid_loss: float = float("inf")
+    train_stage: int = 2
 
     def state_dict(self):
         return {
@@ -52,6 +54,7 @@ class TrainingState:
             "epoch": self.epoch,
             "elapsed_time": self.elapsed_time,
             "best_valid_loss": self.best_valid_loss,
+            "train_stage": self.train_stage,
         }
 
     def load_state_dict(self, state_dict):
@@ -59,6 +62,7 @@ class TrainingState:
         self.step = state_dict["step"]
         self.elapsed_time = state_dict["elapsed_time"]
         self.best_valid_loss = state_dict["best_valid_loss"]
+        self.train_stage = state_dict.get("train_stage", 2)
 
     def save_state_dict(self, path):
         OmegaConf.save(self.state_dict(), path)
@@ -131,15 +135,18 @@ class DiffusionTrainer(object):
         condition_diagnostics_every=1,
         save_strategy="epoch",
         save_steps=1,
+        save_steps_schedule=None,
         save_best_and_last_only=False,
         load_best_model_at_end=False,
         resume_from_checkpoint=None,
         test_num_showers=None,
+        test_output_subdir=None,
         enable_plots=True,
         enable_fpd=False,
         save_test_model_artifact=False,
         save_generated=False,
         fpd_config=None,
+        freeze_then_unfreeze=None,
         **kwargs,
     ):
         super().__init__()
@@ -191,24 +198,19 @@ class DiffusionTrainer(object):
         self.model = self.accelerator.prepare(model)
         self.model.train()
 
-        # optimization
-        optimizer_class_str = None
-        if isinstance(optimizer_class, str):
-            optimizer_class_str = optimizer_class
-            optimizer_class = import_class_by_name(optimizer_class)
-
-        if optimizer_class_str == 'src.optimizers.BiasedAdamW':
-            self.optimizer = optimizer_class(self.model, lr=learning_rate, **optimizer_args)
-        else:
-            self.optimizer = optimizer_class(self.model.parameters(), lr=learning_rate, **optimizer_args)
-        self.optimizer = self.accelerator.prepare(self.optimizer)
-
-        self.lr_scheduler = None
-        if lr_scheduler_class is not None:
-            if isinstance(lr_scheduler_class, str):
-                lr_scheduler_class = import_class_by_name(lr_scheduler_class)
-            self.lr_scheduler = lr_scheduler_class(self.optimizer, **lr_scheduler_args)
-            self.lr_scheduler = AcceleratedScheduler(self.lr_scheduler, self.optimizer, step_with_optimizer=False)
+        self.base_learning_rate = learning_rate
+        self.optimizer_args = dict(optimizer_args or {})
+        self.lr_scheduler_args = dict(lr_scheduler_args or {})
+        self.optimizer_class = import_class_by_name(optimizer_class) if isinstance(optimizer_class, str) else optimizer_class
+        self.lr_scheduler_class = (
+            import_class_by_name(lr_scheduler_class) if isinstance(lr_scheduler_class, str) else lr_scheduler_class
+        )
+        self.freeze_then_unfreeze = self._normalize_freeze_schedule(freeze_then_unfreeze)
+        self._freeze_resume_state = self._peek_resume_training_state(
+            Path(resume_from_checkpoint) if resume_from_checkpoint else None
+        )
+        self.state.train_stage = self._infer_initial_train_stage()
+        self._apply_training_stage(self.state.train_stage, initial=True)
 
         self.max_grad_value = max_grad_value
         self.max_grad_norm = max_grad_norm
@@ -260,6 +262,7 @@ class DiffusionTrainer(object):
         self.valid_strategy, self.valid_steps = parse_strategy(valid_strategy, valid_steps)
         self.test_strategy, self.test_steps = parse_strategy(test_strategy, test_steps)
         self.test_num_showers = test_num_showers
+        self.test_output_subdir = test_output_subdir
         self.test_conditions = test_conditions
         self.enable_plots = enable_plots
         self.enable_fpd = enable_fpd
@@ -271,6 +274,13 @@ class DiffusionTrainer(object):
         self.plot_dir.mkdir(exist_ok=True, parents=True)
 
         self.save_strategy, self.save_steps = parse_strategy(save_strategy, save_steps)
+        self.save_steps_schedule = self._normalize_step_schedule(
+            schedule=save_steps_schedule,
+            strategy=self.save_strategy,
+            default_interval=self.save_steps,
+            interval_key="save_steps",
+            schedule_name="save_steps_schedule",
+        )
         self.save_best_and_last_only = save_best_and_last_only
 
         self.checkpoint_dir = self.output_dir / "checkpoints"
@@ -281,12 +291,77 @@ class DiffusionTrainer(object):
         self.resume_from_checkpoint = Path(resume_from_checkpoint) if resume_from_checkpoint else None
         if self.resume_from_checkpoint:
             self.load_state(self.resume_from_checkpoint)
+            self._maybe_advance_training_stage()
 
         unwrap_ddp(self.model).record_condition_diagnostics = self.log_condition_diagnostics
 
     @property
     def device(self):
         return self.accelerator.device
+
+    @staticmethod
+    def _normalize_step_schedule(schedule, strategy, default_interval, interval_key, schedule_name):
+        if schedule is None:
+            return []
+        if strategy != "steps":
+            raise ValueError(f"{schedule_name} requires `save_strategy: steps`, got {strategy!r}.")
+
+        normalized = []
+        for raw_entry in schedule:
+            if raw_entry is None:
+                continue
+
+            start_step = raw_entry.get("start_step")
+            interval = raw_entry.get(interval_key)
+            if start_step is None or interval is None:
+                raise ValueError(
+                    f"Each entry in {schedule_name} must define `start_step` and `{interval_key}`."
+                )
+
+            start_step = int(start_step)
+            interval = int(interval)
+            if start_step < 0:
+                raise ValueError(f"{schedule_name} start_step must be >= 0, got {start_step}.")
+            if interval <= 0:
+                raise ValueError(f"{schedule_name} {interval_key} must be > 0, got {interval}.")
+
+            normalized.append((start_step, interval))
+
+        normalized.sort(key=lambda item: item[0])
+        if normalized and normalized[0][0] == 0:
+            default_interval = normalized[0][1]
+
+        deduped = []
+        last_start_step = None
+        for start_step, interval in normalized:
+            if start_step == last_start_step:
+                deduped[-1] = (start_step, interval)
+            else:
+                deduped.append((start_step, interval))
+                last_start_step = start_step
+
+        if deduped and deduped[0][0] > 0:
+            deduped.insert(0, (0, int(default_interval)))
+
+        return deduped
+
+    @staticmethod
+    def _resolve_step_interval(step, default_interval, schedule):
+        interval = int(default_interval)
+        for start_step, scheduled_interval in schedule:
+            if step >= start_step:
+                interval = scheduled_interval
+            else:
+                break
+        return interval
+
+    def _should_save_checkpoint(self):
+        save_interval = self._resolve_step_interval(
+            step=self.state.step,
+            default_interval=self.save_steps,
+            schedule=self.save_steps_schedule,
+        )
+        return self.state.step % save_interval == 0
 
     def _build_sampling_conditions(self, incident_energy, phi, theta, geometry):
         energy = torch.as_tensor(
@@ -339,6 +414,124 @@ class DiffusionTrainer(object):
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
         dataloader = prepare_data_loader(dataloader, dispatch_batches=True, put_on_device=True)
         return dataloader
+
+    def _normalize_freeze_schedule(self, freeze_then_unfreeze):
+        if not freeze_then_unfreeze or not freeze_then_unfreeze.get("enabled", False):
+            return None
+
+        trainable_prefixes = list(freeze_then_unfreeze.get("trainable_prefixes", []))
+        stage1_learning_rate = freeze_then_unfreeze.get("stage1_learning_rate", self.base_learning_rate)
+        stage1_optimizer_args = dict(freeze_then_unfreeze.get("stage1_optimizer_args", self.optimizer_args))
+        stage1_lr_scheduler_args = freeze_then_unfreeze.get("stage1_lr_scheduler_args", {})
+        stage1_optimizer_class = freeze_then_unfreeze.get("stage1_optimizer_class")
+        stage1_lr_scheduler_class = freeze_then_unfreeze.get("stage1_lr_scheduler_class")
+
+        if isinstance(stage1_optimizer_class, str):
+            stage1_optimizer_class = import_class_by_name(stage1_optimizer_class)
+        if isinstance(stage1_lr_scheduler_class, str):
+            stage1_lr_scheduler_class = import_class_by_name(stage1_lr_scheduler_class)
+
+        return {
+            "unfreeze_at_step": int(freeze_then_unfreeze.get("unfreeze_at_step", 0)),
+            "trainable_prefixes": trainable_prefixes,
+            "stage1_learning_rate": stage1_learning_rate,
+            "stage1_optimizer_class": stage1_optimizer_class or self.optimizer_class,
+            "stage1_optimizer_args": stage1_optimizer_args,
+            "stage1_lr_scheduler_class": stage1_lr_scheduler_class,
+            "stage1_lr_scheduler_args": dict(stage1_lr_scheduler_args),
+        }
+
+    def _peek_resume_training_state(self, checkpoint_dir: Optional[Path]):
+        if checkpoint_dir is None:
+            return None
+        state_path = checkpoint_dir / "state.yaml"
+        if not state_path.exists():
+            return None
+        return OmegaConf.to_container(OmegaConf.load(state_path), resolve=True)
+
+    def _infer_initial_train_stage(self):
+        if self.freeze_then_unfreeze is None:
+            return 2
+        if self._freeze_resume_state is not None:
+            if "train_stage" in self._freeze_resume_state:
+                return int(self._freeze_resume_state["train_stage"])
+            if int(self._freeze_resume_state.get("step", 0)) >= self.freeze_then_unfreeze["unfreeze_at_step"]:
+                return 2
+        return 1
+
+    def _set_trainable_by_prefixes(self, trainable_prefixes):
+        trainable_prefixes = tuple(trainable_prefixes or [])
+        total_params = 0
+        trainable_params = 0
+        raw_model = unwrap_ddp(self.model)
+        for name, param in raw_model.named_parameters():
+            is_trainable = True if not trainable_prefixes else any(name.startswith(prefix) for prefix in trainable_prefixes)
+            param.requires_grad_(is_trainable)
+            total_params += param.numel()
+            if is_trainable:
+                trainable_params += param.numel()
+        return trainable_params, total_params
+
+    def _build_optimizer_and_scheduler(self, learning_rate, optimizer_class, optimizer_args, lr_scheduler_class, lr_scheduler_args):
+        optimizer_init_params = inspect.signature(optimizer_class.__init__).parameters
+        if "model" in optimizer_init_params:
+            optimizer = optimizer_class(self.model, lr=learning_rate, **optimizer_args)
+        else:
+            optimizer = optimizer_class(self.model.parameters(), lr=learning_rate, **optimizer_args)
+        optimizer = self.accelerator.prepare(optimizer)
+
+        lr_scheduler = None
+        if lr_scheduler_class is not None:
+            lr_scheduler = lr_scheduler_class(optimizer, **lr_scheduler_args)
+            lr_scheduler = AcceleratedScheduler(lr_scheduler, optimizer, step_with_optimizer=False)
+
+        return optimizer, lr_scheduler
+
+    def _apply_training_stage(self, stage, initial=False):
+        if stage == 1 and self.freeze_then_unfreeze is not None:
+            trainable_params, total_params = self._set_trainable_by_prefixes(self.freeze_then_unfreeze["trainable_prefixes"])
+            learning_rate = self.freeze_then_unfreeze["stage1_learning_rate"]
+            optimizer_class = self.freeze_then_unfreeze["stage1_optimizer_class"]
+            optimizer_args = self.freeze_then_unfreeze["stage1_optimizer_args"]
+            lr_scheduler_class = self.freeze_then_unfreeze["stage1_lr_scheduler_class"]
+            lr_scheduler_args = self.freeze_then_unfreeze["stage1_lr_scheduler_args"]
+            stage_label = "stage1_frozen_backbone"
+        else:
+            trainable_params, total_params = self._set_trainable_by_prefixes([])
+            learning_rate = self.base_learning_rate
+            optimizer_class = self.optimizer_class
+            optimizer_args = self.optimizer_args
+            lr_scheduler_class = self.lr_scheduler_class
+            lr_scheduler_args = self.lr_scheduler_args
+            stage_label = "stage2_full_finetune"
+
+        self.optimizer, self.lr_scheduler = self._build_optimizer_and_scheduler(
+            learning_rate=learning_rate,
+            optimizer_class=optimizer_class,
+            optimizer_args=optimizer_args,
+            lr_scheduler_class=lr_scheduler_class,
+            lr_scheduler_args=lr_scheduler_args,
+        )
+        self.state.train_stage = stage
+
+        logger.info(
+            "Configured %s at step %s with lr=%s; trainable params=%s/%s",
+            stage_label,
+            self.state.step,
+            learning_rate,
+            trainable_params,
+            total_params,
+        )
+        if not initial and self.accelerator.is_main_process and hasattr(self, "writer"):
+            self.writer.add_scalar("Train/Stage", stage, global_step=self.state.step)
+            self.writer.add_scalar("Train/Trainable Parameters", trainable_params, global_step=self.state.step)
+
+    def _maybe_advance_training_stage(self):
+        if self.freeze_then_unfreeze is None:
+            return
+        should_unfreeze = self.state.step >= self.freeze_then_unfreeze["unfreeze_at_step"]
+        if should_unfreeze and self.state.train_stage == 1:
+            self._apply_training_stage(2)
 
     def loss_fn(self, model, x_0, x_cond, step=None):
         """Loss function. By default, it returns the loss implemented by the model class."""
@@ -443,6 +636,7 @@ class DiffusionTrainer(object):
         valid_loss = float("inf")
         try:
             while self.state.step < self.max_steps:
+                self._maybe_advance_training_stage()
                 train_loss = self._training_step()
                 train_running_losses.append(train_loss)
                 train_epoch_losses.append(train_loss)
@@ -469,7 +663,7 @@ class DiffusionTrainer(object):
 
                 self._anneal_learning_rate(valid_loss)
 
-                if self.state.step % self.save_steps == 0 and self.accelerator.is_main_process:
+                if self._should_save_checkpoint() and self.accelerator.is_main_process:
                     self.save_state("last" if self.save_best_and_last_only else self.state.step)
 
                 self.state.epoch = math.ceil(self.state.step / self.batches_per_epoch)
@@ -517,6 +711,8 @@ class DiffusionTrainer(object):
 
         logger.info("Testing...")
         step_output_dir = self.plot_dir / f"{self.state.step}"
+        if exists(self.test_output_subdir):
+            step_output_dir = step_output_dir / self.test_output_subdir
         model_artifact_path = None
         if self.save_test_model_artifact and self.accelerator.is_main_process:
             step_output_dir.mkdir(parents=True, exist_ok=True)
@@ -542,7 +738,7 @@ class DiffusionTrainer(object):
 
         for geometry, energy, phi, theta, fullsim_path in self.test_conditions:
             conditions_str = get_conditions_str(geometry, energy, phi, theta)
-            output_dir = self.plot_dir / f"{self.state.step}/{conditions_str}"
+            output_dir = step_output_dir / conditions_str
             postprocess_done_path = output_dir / ".postprocess_done"
             postprocess_failed_path = output_dir / ".postprocess_failed"
             needs_main_postprocess = self.enable_plots or save_generated or self.enable_fpd
@@ -783,6 +979,11 @@ class DiffusionTrainer(object):
 
             self.accelerator.wait_for_everyone()
 
+    def _get_checkpointable_lr_scheduler(self):
+        if self.lr_scheduler is None:
+            return None
+        return getattr(self.lr_scheduler, "scheduler", self.lr_scheduler)
+
     def save_state(self, milestone="last"):
         self.state.elapsed_time = self.timer.lap()
 
@@ -791,6 +992,9 @@ class DiffusionTrainer(object):
         )
         checkpoint_dir.mkdir(exist_ok=True, parents=True)
         self.accelerator.save_state(checkpoint_dir, safe_serialization=False)
+        checkpointable_lr_scheduler = self._get_checkpointable_lr_scheduler()
+        if checkpointable_lr_scheduler is not None:
+            torch.save(checkpointable_lr_scheduler.state_dict(), checkpoint_dir / "scheduler.bin")
         self.state.save_state_dict(checkpoint_dir / "state.yaml")
         OmegaConf.save(self.config, checkpoint_dir / "config.yaml")
 
@@ -804,6 +1008,17 @@ class DiffusionTrainer(object):
     def load_state(self, checkpoint_dir):
         logger.info(f"Loading checkpoint from {checkpoint_dir}")
         self.accelerator.load_state(checkpoint_dir)
+        checkpointable_lr_scheduler = self._get_checkpointable_lr_scheduler()
+        scheduler_path = checkpoint_dir / "scheduler.bin"
+        if checkpointable_lr_scheduler is not None:
+            if scheduler_path.exists():
+                checkpointable_lr_scheduler.load_state_dict(torch.load(scheduler_path, map_location="cpu"))
+            else:
+                logger.warning(
+                    "No lr scheduler state found in %s. This checkpoint predates scheduler checkpointing, "
+                    "so resuming may use an incorrect learning-rate schedule.",
+                    checkpoint_dir,
+                )
         self.config = OmegaConf.load(checkpoint_dir / "config.yaml")
 
     def save_model(self, save_path: Union[str, Path] = None):

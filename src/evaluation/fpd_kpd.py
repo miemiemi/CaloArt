@@ -20,6 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 GEOMETRY_TO_PARTICLE = {
     "CCD2": "electron",
     "CCD3": "electron",
+    "CCD3_REBINNED_45X25X9": "electron",
     "1-photons": "photon",
     "1-pions": "pion",
 }
@@ -27,6 +28,7 @@ GEOMETRY_TO_PARTICLE = {
 GEOMETRY_TO_XML = {
     "CCD2": REPO_ROOT / "cc_metrics" / "binning_dataset_2.xml",
     "CCD3": REPO_ROOT / "cc_metrics" / "binning_dataset_3.xml",
+    "CCD3_REBINNED_45X25X9": REPO_ROOT / "cc_metrics" / "binning_dataset_3_45x25x9.xml",
     "1-photons": REPO_ROOT / "cc_metrics" / "binning_dataset_1_photons.xml",
     "1-pions": REPO_ROOT / "cc_metrics" / "binning_dataset_1_pions.xml",
 }

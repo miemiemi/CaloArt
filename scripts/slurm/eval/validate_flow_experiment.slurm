@@ -22,6 +22,7 @@ VALIDATE_CONFIG="${VALIDATE_CONFIG:-experiment/CaloChallenge/validate/ccd2_flow}
 SAMPLING_STEPS="${SAMPLING_STEPS:-50}"
 SAMPLING_SOLVER="${SAMPLING_SOLVER:-heun}"
 ARCH_TARGET="${ARCH_TARGET:-}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 mkdir -p "${REPO_DIR}/logs/slurm"
 
@@ -40,6 +41,7 @@ echo "VALIDATE_CONFIG=${VALIDATE_CONFIG}"
 echo "SAMPLING_STEPS=${SAMPLING_STEPS}"
 echo "SAMPLING_SOLVER=${SAMPLING_SOLVER}"
 echo "ARCH_TARGET=${ARCH_TARGET:-saved-config}"
+echo "EXTRA_ARGS=${EXTRA_ARGS:-<none>}"
 nvidia-smi
 
 python scripts/export_checkpoint.py \
@@ -59,6 +61,12 @@ CMD=(
 
 if [[ -n "${ARCH_TARGET}" ]]; then
   CMD+=(+model.architecture.target="${ARCH_TARGET}")
+fi
+
+if [[ -n "${EXTRA_ARGS}" ]]; then
+  # shellcheck disable=SC2206
+  EXTRA_ARGS_ARRAY=( ${EXTRA_ARGS} )
+  CMD+=("${EXTRA_ARGS_ARRAY[@]}")
 fi
 
 printf 'Running validate command:'

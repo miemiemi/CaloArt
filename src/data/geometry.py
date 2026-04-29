@@ -23,6 +23,15 @@ CCD_GEOMETRIES = {
         "SIZE_R": 2.325,
         "RAW_FLAT_SIZE": 45 * 50 * 18,
     },
+    "CCD3_REBINNED_45X25X9": {
+        "NAME": "CCD3_REBINNED_45X25X9",
+        "N_CELLS_Z": 45,
+        "N_CELLS_PHI": 25,
+        "N_CELLS_R": 9,
+        "SIZE_Z": 3.4,
+        "SIZE_R": 4.65,
+        "RAW_FLAT_SIZE": 45 * 25 * 9,
+    },
 }
 
 

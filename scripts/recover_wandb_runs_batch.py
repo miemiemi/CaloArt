@@ -87,6 +87,8 @@ def load_wandb_config(config_yaml: Path) -> dict[str, Any]:
 
 
 def load_summary(summary_json: Path) -> dict[str, Any]:
+    if not summary_json.exists():
+        return {}
     return json.loads(summary_json.read_text())
 
 
@@ -158,10 +160,12 @@ def get_remote_step(api: wandb.Api, entity: str, project: str, run_id: str) -> t
     run = get_remote_run(api, entity, project, run_id)
     if run is None:
         return -1, None
-    step = run.summary.get("global_step")
-    if step is None:
+    summary_step = run.summary.get("global_step")
+    history_step = run.lastHistoryStep
+    if summary_step is None and history_step is None:
         return -1, run.state
-    return int(step), run.state
+    candidates = [value for value in (summary_step, history_step) if value is not None]
+    return int(max(candidates)), run.state
 
 
 def run_chunk(metadata: dict[str, Any], args: argparse.Namespace, chunk_start: int, chunk_end: int) -> None:
@@ -186,7 +190,7 @@ def run_chunk(metadata: dict[str, Any], args: argparse.Namespace, chunk_start: i
         "--progress-every",
         str(args.progress_every),
     ]
-    if chunk_end >= metadata["final_step"]:
+    if chunk_end >= metadata["final_step"] and metadata["summary_json"].exists():
         cmd += ["--summary-json", str(metadata["summary_json"])]
 
     print()

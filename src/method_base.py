@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torchinfo import summary
 
+from src.config_utils import sanitize_config_for_artifact
 from src.utils import get_logger
 
 logger = get_logger()
@@ -30,7 +31,13 @@ class MethodBase(nn.Module):
         self.config = config
 
     def save_state(self, save_path: Union[str, Path]) -> None:
-        torch.save({"model": self.model.state_dict(), "config": self.config}, save_path)
+        torch.save(
+            {
+                "model": self.model.state_dict(),
+                "config": sanitize_config_for_artifact(self.config),
+            },
+            save_path,
+        )
         logger.info(f"Saved model to {save_path}")
 
     def load_state(self, load_path: Union[str, Path]) -> None:

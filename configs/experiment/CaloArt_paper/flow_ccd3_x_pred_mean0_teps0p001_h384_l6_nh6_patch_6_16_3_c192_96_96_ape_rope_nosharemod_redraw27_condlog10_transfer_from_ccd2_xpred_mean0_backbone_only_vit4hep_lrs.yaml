@@ -1,0 +1,105 @@
+# @package _global_
+
+# CCD3 transfer experiment:
+# backbone-only transfer from the CCD2 x_pred_mean0 source checkpoint.
+# Learning rates follow the vit4hep-style grouped finetuning recipe:
+# backbone (blocks + t_embedder) at 1e-4, head at 5e-4, embedders at 5e-4.
+
+defaults:
+  - /data: ccd3
+  - /preprocessing@preprocessing: ccd3_cond_energy_log10
+  - /model@model.architecture: calolightning_h384_ape_rope_c192_96_96_no_share_rmsnorm_nh6_patch_6_16_3_classicdit
+  - /method: flow_matching/x_pred_mean0_teps0p001
+  - /sampling: flow/heun_32
+  - _self_
+
+hydra:
+  job:
+    chdir: False
+  run:
+    dir: .
+  output_subdir: null
+
+experiment:
+  project_name: CaloArt_paper
+  run_name: flow_ccd3_x_pred_mean0_teps0p001_h384_l6_nh6_patch_6_16_3_c192_96_96_ape_rope_nosharemod_redraw27_condlog10_transfer_from_ccd2_xpred_mean0_backbone_only_vit4hep_lrs
+  output_dir: ./experiments
+  seed: 42
+  use_wandb: true
+
+accelerator:
+  cpu: false
+  mixed_precision: "no"
+
+model:
+  model_path: null
+
+sampling:
+  steps: 32
+  solver: heun
+  reject_redraw: true
+  reject_redraw_max_ratio: 2.7
+  reject_redraw_reject_nonfinite: true
+
+train:
+  learning_rate: 1.0e-04
+  global_batch_size: 256
+  num_workers: 0
+  valid_num_workers: 0
+  max_steps: 120000
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_class: src.optimizers.LayerwiseAdamW
+  optimizer_args:
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-05
+    param_group_specs:
+      - name: embedder_patch
+        prefix: patch_embedder.
+        lr: 5.0e-04
+      - name: embedder_energy
+        prefix: energy_embedder.
+        lr: 5.0e-04
+      - name: embedder_phi
+        prefix: phi_embedder.
+        lr: 5.0e-04
+      - name: embedder_theta
+        prefix: theta_embedder.
+        lr: 5.0e-04
+      - name: head_final
+        prefix: final_layer.
+        lr: 5.0e-04
+  lr_scheduler_class: src.lr_schedulers.get_lr_scheduler
+  lr_scheduler_args:
+    lr_scheduler_type: cosine
+    num_training_steps: 120000
+    num_warmup_steps: 5000
+  ema_scheduler_class: src.models.ema.InverseDecayEMA
+  ema_scheduler_args:
+    power: 0.7
+    max_value: 0.9999
+  sampling_args: ${sampling}
+  valid_strategy: steps
+  valid_steps: 4999
+  logging_strategy: steps
+  logging_steps: 100
+  save_strategy: steps
+  save_steps: 9999
+  save_best_and_last_only: true
+  load_best_model_at_end: false
+  test_strategy: steps
+  test_steps: 19999
+  test_num_showers: 1000
+  test_conditions:
+    - ['CCD3', -1, 0.0, 1.57, '/aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets/dataset_3_3_4.hdf5']
+  enable_plots: true
+  enable_fpd: false
+  save_test_model_artifact: true
+  save_generated: false
+  fpd_config:
+    cut: 0.015151515151515152
+    save_generated: false
+    compute_kpd: false
+  need_geo_condn: false
+  train_on: null

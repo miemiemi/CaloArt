@@ -19,7 +19,7 @@ from src.data.preprocessing import CaloShowerPreprocessor
 from src.models.calodit_3drope import FinalLayer as LegacyGatedFinalLayer
 from src.models.factory import create_model_from_config
 from src.trainer import DiffusionTrainer
-from src.utils import get_logger, import_class_by_name, setup_accelerator
+from src.utils import get_logger, import_class_by_name, set_seed, setup_accelerator
 
 
 def build_model_with_legacy_final_layer(cfg: DictConfig):
@@ -110,6 +110,11 @@ def main(cfg: DictConfig):
     model.save_config(cfg)
 
     logger.info(f"Resolved checkpoint test config:\n{OmegaConf.to_yaml(cfg)}")
+
+    seed = OmegaConf.select(cfg, "experiment.seed")
+    if seed is not None:
+        set_seed(int(seed), all_gpus=True)
+        logger.info("Set random seed to %s for checkpoint test sampling.", int(seed))
 
     preprocessor = CaloShowerPreprocessor(**cfg.preprocessing)
 

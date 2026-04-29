@@ -1,0 +1,144 @@
+data:
+  train:
+    files:
+    - /aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets/dataset_3_1_2.hdf5
+    use_cond_info: true
+    is_ccd: true
+    ccd_geometry: CCD3
+  valid:
+    files:
+    - /aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets/dataset_3_3_4.hdf5
+    use_cond_info: true
+    is_ccd: true
+    ccd_geometry: CCD3
+
+preprocessing:
+  steps:
+  - class_name: src.data.preprocessing.CutNoise
+    init_args:
+      noise_level: 5.0e-07
+      both_directions: true
+  - class_name: src.data.preprocessing.LogTransform
+    init_args:
+      eps: 1.0e-06
+  - class_name: src.data.preprocessing.Standarize
+    init_args:
+      mean: -13.2129706
+      std: 1.832286
+
+model:
+  architecture:
+    target: src.models.CaloLightningDiT
+    init_args:
+      input_size:
+      - 18
+      - 50
+      - 45
+      patch_size:
+      - 6
+      - 16
+      - 3
+      conditions_size:
+      - 1
+      - 2
+      - 1
+      condition_embed_dims:
+      - 192
+      - 96
+      - 96
+      in_channels: 1
+      out_channels: 1
+      model_channels: 384
+      num_blocks: 6
+      num_heads: 6
+      mlp_ratio: 4
+      pe_mode: ape+rope
+      rope_freq:
+      - 1.0
+      - 10000.0
+      share_mod: false
+      qk_rms_norm: true
+      use_checkpoint: false
+      use_conv: true
+      initialization: vanilla
+  model_path: null
+
+method:
+  kind: flow
+  target: src.flow.FlowMatching
+  init_args:
+    predict_mode: pred_x1
+    loss_target: v
+    time_sampler: logit_normal
+    logit_normal_mean: -0.8
+    logit_normal_std: 0.8
+    noise_scale: 1.0
+    t_eps: 0.05
+
+sampling:
+  steps: 32
+  solver: heun
+
+experiment:
+  project_name: caloflow_v1
+  run_name: flow_ccd3_x_pred_patch_6_16_3_h384_fp32merge_a800_rerun_20260424
+  output_dir: ./experiments
+  seed: 42
+  use_wandb: true
+
+accelerator:
+  cpu: false
+  mixed_precision: "no"
+
+train:
+  learning_rate: 0.0005
+  global_batch_size: 256
+  num_workers: 0
+  valid_num_workers: 0
+  max_steps: 400000
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_class: torch.optim.AdamW
+  optimizer_args:
+    betas:
+    - 0.9
+    - 0.95
+    eps: 1.0e-08
+    weight_decay: 1.0e-05
+  lr_scheduler_class: src.lr_schedulers.get_lr_scheduler
+  lr_scheduler_args:
+    lr_scheduler_type: cosine
+    num_training_steps: 400000
+    num_warmup_steps: 10000
+  ema_scheduler_class: src.models.ema.InverseDecayEMA
+  ema_scheduler_args:
+    power: 0.7
+    max_value: 0.9999
+  sampling_args: ${sampling}
+  valid_strategy: steps
+  valid_steps: 4999
+  logging_strategy: steps
+  logging_steps: 100
+  save_strategy: steps
+  save_steps: 49999
+  save_best_and_last_only: true
+  load_best_model_at_end: false
+  test_strategy: steps
+  test_steps: 49999
+  test_num_showers: 100000
+  test_conditions:
+  - - CCD3
+    - -1
+    - 0.0
+    - 1.57
+    - /aifs/user/home/huangzhengkun/datasets/hepdatasets/calochallenge_datasets/dataset_3_3_4.hdf5
+  enable_plots: true
+  enable_fpd: true
+  save_test_model_artifact: true
+  save_generated: true
+  fpd_config:
+    cut: 0.015151515151515152
+    save_generated: true
+    compute_kpd: false
+  need_geo_condn: false
+  train_on: null

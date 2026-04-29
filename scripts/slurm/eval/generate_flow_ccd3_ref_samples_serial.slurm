@@ -15,7 +15,33 @@ REPO_DIR="/aifs/user/home/huangzhengkun/work/repositories/CaloFlow"
 DEFAULT_EXPERIMENT_DIR="${REPO_DIR}/experiments/caloflow_v1/flow_ccd3_x_pred_jit_like_h384_l6_nh6_patch_6_16_3_c192_96_96_ape_rope_nosharemod_5090_80g_redraw27_um04"
 
 echo "Starting serial CCD3 checkpoint generation on $(hostname)"
-source ~/miniconda3/etc/profile.d/conda.sh
+CONDA_SH=""
+if [[ -n "${CONDA_EXE:-}" ]]; then
+  CONDA_SH="$(dirname "$(dirname "${CONDA_EXE}")")/etc/profile.d/conda.sh"
+elif command -v conda >/dev/null 2>&1; then
+  CONDA_BIN="$(command -v conda)"
+  CONDA_SH="$(dirname "$(dirname "${CONDA_BIN}")")/etc/profile.d/conda.sh"
+fi
+
+if [[ ! -f "${CONDA_SH}" ]]; then
+  for candidate in \
+    "/aifs/user/home/huangzhengkun/miniconda3/etc/profile.d/conda.sh" \
+    "${HOME}/miniconda3/etc/profile.d/conda.sh" \
+    "/afs/ihep.ac.cn/users/h/huangzhengkun/miniconda3/etc/profile.d/conda.sh"
+  do
+    if [[ -f "${candidate}" ]]; then
+      CONDA_SH="${candidate}"
+      break
+    fi
+  done
+fi
+
+if [[ ! -f "${CONDA_SH}" ]]; then
+  echo "Could not locate conda.sh. Set CONDA_EXE or edit the script for your environment." >&2
+  exit 1
+fi
+
+source "${CONDA_SH}"
 conda activate CaloFlow
 
 cd "${REPO_DIR}"
@@ -38,11 +64,15 @@ SAMPLING_STEPS="${SAMPLING_STEPS:-}"
 SAMPLING_SOLVER="${SAMPLING_SOLVER:-}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-}"
 TEST_CONDITIONS_OVERRIDE="${TEST_CONDITIONS_OVERRIDE:-}"
+TEST_OUTPUT_SUBDIR="${TEST_OUTPUT_SUBDIR:-}"
 REJECT_REDRAW="${REJECT_REDRAW:-}"
 REJECT_REDRAW_MAX_RATIO="${REJECT_REDRAW_MAX_RATIO:-}"
 REJECT_REDRAW_REJECT_NONFINITE="${REJECT_REDRAW_REJECT_NONFINITE:-}"
 NUM_PROCESSES="${NUM_PROCESSES:-1}"
-MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-$((20000 + SLURM_JOB_ID % 20000))}"
+PORT_SEED="${SLURM_JOB_ID:-$$}"
+MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-$((20000 + PORT_SEED % 20000))}"
+export CALOFLOW_H5_GZIP_THREADS="${CALOFLOW_H5_GZIP_THREADS:-${SLURM_CPUS_PER_TASK:-1}}"
+export CALOFLOW_H5_GZIP_LEVEL="${CALOFLOW_H5_GZIP_LEVEL:-9}"
 
 if [[ ! -d "${EXPERIMENT_DIR}" ]]; then
   echo "Experiment directory does not exist: ${EXPERIMENT_DIR}" >&2
@@ -79,7 +109,10 @@ echo "ENABLE_FPD=${ENABLE_FPD}"
 echo "SAVE_GENERATED=${SAVE_GENERATED}"
 echo "SKIP_EXISTING=${SKIP_EXISTING}"
 echo "CONTINUE_ON_ERROR=${CONTINUE_ON_ERROR}"
+echo "TEST_OUTPUT_SUBDIR=${TEST_OUTPUT_SUBDIR:-<none>}"
 echo "NUM_PROCESSES=${NUM_PROCESSES}"
+echo "CALOFLOW_H5_GZIP_THREADS=${CALOFLOW_H5_GZIP_THREADS}"
+echo "CALOFLOW_H5_GZIP_LEVEL=${CALOFLOW_H5_GZIP_LEVEL}"
 
 failures=()
 
@@ -156,6 +189,10 @@ for step in "${STEPS[@]}"; do
 
   if [[ -n "${TEST_CONDITIONS_OVERRIDE}" ]]; then
     CMD+=("+train.test_conditions=${TEST_CONDITIONS_OVERRIDE}")
+  fi
+
+  if [[ -n "${TEST_OUTPUT_SUBDIR}" ]]; then
+    CMD+=("+train.test_output_subdir=${TEST_OUTPUT_SUBDIR}")
   fi
 
   if [[ -n "${REJECT_REDRAW}" ]]; then
