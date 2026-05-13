@@ -5,7 +5,7 @@
 [![arXiv](https://img.shields.io/badge/paper-arXiv%3A2605.12011-B31B1B.svg)](https://arxiv.org/abs/2605.12011)
 
 <p align="center">
-  <img src="images/backbone.png" width="100%">
+  <img src="images/backbone.png" width="80%">
 </p>
 
 This is a PyTorch/GPU implementation of the paper
@@ -29,8 +29,8 @@ Download the CaloChallenge dataset files and place them in your
 
 | Dataset | DOI |
 | --- | --- |
-| CCD2 | [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.6366270.svg)](https://doi.org/10.5281/zenodo.6366270) |
-| CCD3 | [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.6366323.svg)](https://doi.org/10.5281/zenodo.6366323) |
+| CCD2 | [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.6366270-1682C3?style=flat-square)](https://doi.org/10.5281/zenodo.6366270) |
+| CCD3 | [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.6366323-1682C3?style=flat-square)](https://doi.org/10.5281/zenodo.6366323) |
 
 For the CCD2 configuration in this repository, the directory should contain:
 
