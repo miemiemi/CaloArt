@@ -152,5 +152,9 @@ If you use this codebase in your research, please consider citing:
 
 ## Acknowledgements
 
-This work builds on the CaloChallenge benchmark and the open-source PyTorch
-ecosystem.
+This work builds on [VisionTransformers4HEP](https://github.com/luigifvr/vit4hep),
+[CaloDitv2](https://github.com/cargicar/CaloDitv2),
+[LightningDiT](https://github.com/hustvl/LightningDiT), and
+[JiT](https://github.com/LTH14/JiT). We thank the
+[CaloChallenge](https://calochallenge.github.io/homepage/) organizers for
+providing the benchmark, datasets, and evaluation setting used by this work.
